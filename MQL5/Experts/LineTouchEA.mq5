@@ -450,6 +450,7 @@ SSavedState     g_saved[];
 SLossRecord     g_losses[];
 int             g_consecLosses = 0;
 string          g_lastBlock    = "";
+bool            g_valReady     = true;    // ValueAreaLevels buffers available
 ulong           g_signalSeq    = 0;
 bool            g_stateDirty   = false;
 double          g_atr          = 0.0;
@@ -652,6 +653,16 @@ bool BarIndexOfTime(const datetime t, double &idx)
      {
       idx = -(double)(t - t0) / (double)PeriodSeconds(_Period);   // future: one bar per period
       return(true);
+     }
+   int total = Bars(_Symbol, _Period);
+   if(total > 1)
+     {
+      datetime tOld = iTime(_Symbol, _Period, total - 1);
+      if(tOld > 0 && t < tOld)                             // before the loaded history: extrapolate
+        {
+         idx = (double)(total - 1) + (double)(tOld - t) / (double)PeriodSeconds(_Period);
+         return(true);
+        }
      }
    int sh = iBarShift(_Symbol, _Period, t, false);
    if(sh < 0)
@@ -868,12 +879,25 @@ color ValBufferColor(const int b)
    return(clrGold);
   }
 
+// carries the previous levels of a source over while that source is temporarily unavailable
+void KeepPreviousLevels(SLevel &out[], const int source, const string keyPrefix)
+  {
+   for(int i = 0; i < ArraySize(g_levels); i++)
+      if(g_levels[i].source == source && (keyPrefix == "" || StartsWith(g_levels[i].key, keyPrefix)))
+         AppendLevel(out, g_levels[i]);
+  }
+
 void ReadValueAreaLevels(SLevel &out[])
   {
    if(g_valHandle == INVALID_HANDLE)
       return;
    if(BarsCalculated(g_valHandle) < 2)
+     {
+      g_valReady = false;                              // still computing: keep the last known levels
+      KeepPreviousLevels(out, LT_SRC_VAL, "");
       return;
+     }
+   g_valReady = true;
    int barsIntoSession = 100000;
    datetime sess = iTime(_Symbol, InpVAL_ProfilePeriod, 0);
    if(sess > 0)
@@ -1103,7 +1127,7 @@ bool ComputeEngineTF(SEngineTF &e)
      {
       ZigZagCompute(high, low, n, InpSR_Depth, InpSR_Deviation, InpSR_Backstep, zz);
       int cnt = CollectPivots(zz, times, n, piv);
-      double ref = low[0];
+      double ref = (g_tick.bid > 0.0) ? g_tick.bid : low[0];     // like Close[0] in the original
       int maxPer = MathMin(InpSR_MaxPerTF, LT_MAX_SR);
       for(int i = 1; i < cnt && e.srCount < maxPer; i++)
         {
@@ -1395,9 +1419,13 @@ void ReadEngineLevels(SLevel &out[])
   {
    for(int j = 0; j < ArraySize(g_eng); j++)
      {
-      if(!g_eng[j].ready)
-         continue;
       string tfs = TFToString(g_eng[j].tf);
+      if(!g_eng[j].ready)
+        {
+         KeepPreviousLevels(out, LT_SRC_ENGINE_SR, "SR:" + tfs + ":");
+         KeepPreviousLevels(out, LT_SRC_ENGINE_TL, "TL:" + tfs + ":");
+         continue;
+        }
       if(g_eng[j].useSR)
          for(int i = 0; i < g_eng[j].srCount; i++)
            {
@@ -1422,7 +1450,10 @@ void ReadEngineLevels(SLevel &out[])
                continue;
             SLevel L;
             L.Reset();
-            L.key      = "TL:" + tfs + ((d == 0) ? ":Down" : ":Up");
+            datetime kt1 = (d == 0) ? g_eng[j].dnT1 : g_eng[j].upT1;
+            datetime kt2 = (d == 0) ? g_eng[j].dnT2 : g_eng[j].upT2;
+            L.key      = "TL:" + tfs + ((d == 0) ? ":Down:" : ":Up:")
+                         + IntegerToString((long)kt1) + ":" + IntegerToString((long)kt2);
             L.label    = tfs + ((d == 0) ? " TL down" : " TL up");
             L.source   = LT_SRC_ENGINE_TL;
             L.kind     = 1;
@@ -3154,7 +3185,11 @@ void MaintainPendingOrders(const bool newBar)
          break;
         }
      }
-   //--- orphans and manual expiry
+   //--- orphans and manual expiry (never while a level source is still warming up)
+   bool sourcesReady = g_valReady;
+   for(int j = 0; j < ArraySize(g_eng); j++)
+      if(!g_eng[j].ready)
+         sourcesReady = false;
    for(int o = OrdersTotal() - 1; o >= 0; o--)
      {
       ulong ticket = OrderGetTicket(o);
@@ -3166,7 +3201,7 @@ void MaintainPendingOrders(const bool newBar)
             claimed = true;
       if(!claimed)
         {
-         if(InpPendingDeleteOrphans)
+         if(InpPendingDeleteOrphans && sourcesReady)
             DeletePending(ticket, "no matching level");
          continue;
         }
@@ -3649,11 +3684,12 @@ void OnTick()
      {
       g_lastBarTime = barTime;
       g_signalsThisBar = 0;
+     }
+   if(newBar || g_atr <= 0.0)
+     {
       UpdateATR();
       UpdateZone();
      }
-   if(g_zone <= 0.0)
-      UpdateZone();
 
    //--- built-in engine: on every new chart bar (and until it is ready)
    bool engineDue = false;
