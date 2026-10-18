@@ -61,8 +61,9 @@ an entry. When levels merge, the cluster takes the best grade.
 3. **Entry mode** (`InpEntryMode`):
    * **Touch** (default): price must arrive from the role's side, enter the zone and then
      turn away from the level by `InpTouchRetreatPercent` of the zone (30 % by default;
-     0 = trade the first tick in the zone). A touch that pierced the level by more than
-     `InpMaxPenetrationATR` x ATR is not a touch. Market order at Ask / Bid.
+     0 = trade the first tick in the zone). A wick may pierce the level by up to
+     `InpMaxPenetrationATR` x ATR and still count once price is back inside the zone; a
+     deeper pierce is not a touch. Market order at Ask / Bid.
    * **Confirm close**: the signal bar must have touched the zone, not pierced deeper than
      the penetration limit, and closed back on the original side with the close in the
      top (support) / bottom (resistance) `InpMinRejectionRatio` of its range. Entry at the
@@ -79,10 +80,11 @@ an entry. When levels merge, the cluster takes the best grade.
 4. **Direction mode** (`InpDirectionMode`): *Bounce* trades the reaction off the level;
    *Breakout* trades the move through the level by the break buffer (sell below support,
    buy above resistance; pending mode then uses stop orders).
-5. **Arming.** After a signal (or a role flip) the level is *used* until price has moved
+5. **Arming.** After a signal the level is *used* until price has moved
    `zone + max(InpRearmPoints, ATR x InpRearmATRFraction)` away from it and
-   `InpCooldownBars` bars have passed. A touch that could not be traded (spread, caps,
-   filters) also marks the level used, so the EA never hammers a level on every tick.
+   `InpCooldownBars` bars have passed; a role flip only starts the cooldown (see step 1).
+   A touch that could not be traded (spread, caps, filters) also marks the level used, so
+   the EA never hammers a level on every tick.
    `InpMaxTradesPerLevel` caps a level for good; `InpMaxLossesPerLevelDay` (default 1)
    disables a level for the rest of the day after it produced a losing trade at that price.
 6. **Caps and filters.** One new trade per bar, `InpMaxOpenPositions`, one position per
@@ -163,6 +165,8 @@ change the inputs.
 * Positions and pending orders are tagged with a short hash of their level in the order
   comment (`LT|a1b2c3d4`) and in memory, so the EA finds them again after a restart. If a
   broker strips order comments, per-level limits only hold while the EA stays attached.
+  Sloped lines are tracked by their anchors, so a line that merely drifts with its slope
+  keeps its state; a line that is re-anchored or redrawn starts over.
 * On netting accounts a signal against an open position is skipped by default
   (`InpOppositeMode`), because a market order in the other direction would reduce or
   reverse the position.

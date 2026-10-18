@@ -73,7 +73,7 @@ enum ENUM_LT_SL_MODE
 
 enum ENUM_LT_TP_MODE
   {
-   LT_TP_NEXT_LEVEL   = 0,       // Next level in trade direction (fallback: R multiple)
+   LT_TP_NEXT_LEVEL   = 0,       // Next level in trade direction (none / low R: InpTPLowRRAction)
    LT_TP_RR           = 1,       // R multiple of the stop-loss distance
    LT_TP_FIXED_POINTS = 2,       // Fixed points from entry
    LT_TP_NONE         = 3        // No take-profit
@@ -381,8 +381,16 @@ struct SSavedState            // level state restored from the state file
    datetime lastFlipTime;
   };
 
-struct SLossRecord            // one losing trade today: level hash and entry price
+struct SLossRecord            // one losing trade today: level hash, entry price and entry time
   {
+   string   hash;
+   double   price;
+   datetime time;
+  };
+
+struct SOrderLevel            // every order this EA sent this session -> level hash / entry price
+  {
+   ulong    order;
    string   hash;
    double   price;
   };
@@ -451,6 +459,9 @@ int             g_adxHandle    = INVALID_HANDLE;
 int             g_valHandle    = INVALID_HANDLE;
 SSavedState     g_saved[];
 SLossRecord     g_losses[];
+SOrderLevel     g_orderLevels[];
+datetime        g_savedAt      = 0;       // header time of the state file that was loaded
+datetime        g_atrBar       = 0;       // signal bar the ATR was last read for
 int             g_consecLosses = 0;
 string          g_lastBlock    = "";
 bool            g_valReady     = true;    // ValueAreaLevels buffers available
@@ -1680,7 +1691,14 @@ bool ApplySavedState(SLevel &L)
      {
       if(g_saved[i].key != L.key)
          continue;
-      if(g_saved[i].price > 0.0 && MathAbs(g_saved[i].price - L.price) > g_zone)
+      double ref = L.price;                            // a sloped line is compared at the time it was saved
+      if(L.kind == 1 && g_savedAt > 0)
+        {
+         double v = 0.0;
+         if(SlopedLevelValue(L, g_savedAt, v))
+            ref = v;
+        }
+      if(g_saved[i].price > 0.0 && MathAbs(g_saved[i].price - ref) > g_zone)
         {
          int lastIdx = ArraySize(g_saved) - 1;          // saved for another price: discard
          if(i != lastIdx)
@@ -1723,11 +1741,39 @@ void RebuildLevels()
       if(old >= 0)
         {
          merged[i].CopyStateFrom(g_levels[old]);
-         if(MathAbs(merged[i].price - g_levels[old].price) > g_zone)
+         bool jumped = false;
+         if(merged[i].kind == 1 && g_levels[old].kind == 1)      // a sloped line drifts every bar: compare anchors
+            jumped = (merged[i].t1 != g_levels[old].t1 || merged[i].t2 != g_levels[old].t2
+                      || MathAbs(merged[i].p1 - g_levels[old].p1) > g_zone
+                      || MathAbs(merged[i].p2 - g_levels[old].p2) > g_zone);
+         else
+            jumped = (MathAbs(merged[i].price - g_levels[old].price) > g_zone);
+         if(jumped)
             ResetLevelDynamics(merged[i]);
         }
       else
          ApplySavedState(merged[i]);
+     }
+   //--- one owner per resting order: a split cluster carries the same ticket to every fragment
+   for(int i = 0; i < ArraySize(merged); i++)
+     {
+      ulong t = merged[i].pendingTicket;
+      if(t == 0)
+         continue;
+      string lk = LinkedKey(t);
+      int keep = i;
+      for(int j = 0; j < ArraySize(merged); j++)
+         if(merged[j].pendingTicket == t && lk != "" && (merged[j].key == lk || IsMember(merged[j], lk)))
+           {
+            keep = j;                                   // the fragment that owns the link key wins
+            break;
+           }
+      for(int j = 0; j < ArraySize(merged); j++)
+         if(j != keep && merged[j].pendingTicket == t)
+           {
+            merged[j].pendingTicket = 0;
+            merged[j].pendingType   = -1;
+           }
      }
    ArrayResize(g_levels, ArraySize(merged));
    for(int i = 0; i < ArraySize(merged); i++)
@@ -1806,6 +1852,7 @@ void LoadState()
       return;
      }
    datetime savedAt = (datetime)StringToInteger(hp[1]);
+   g_savedAt = savedAt;
    if(TimeCurrent() - savedAt > 7 * 86400)
      {
       FileClose(h);
@@ -1860,7 +1907,10 @@ void UpdateATR()
    double a[];
    ArraySetAsSeries(a, true);
    if(CopyBuffer(g_atrHandle, 0, 1, 1, a) == 1 && a[0] > 0.0)
+     {
       g_atr = a[0];
+      g_atrBar = SignalBarTime(0);
+     }
   }
 
 void UpdateZone()
@@ -1937,6 +1987,33 @@ int CountPendingOrders()
       n++;
      }
    return(n);
+  }
+
+// comment-independent memory of which level an order was sent for (not pruned within the session)
+void RememberOrderLevel(const ulong order, const string key, const double price)
+  {
+   if(order == 0 || key == "")
+      return;
+   for(int i = 0; i < ArraySize(g_orderLevels); i++)
+      if(g_orderLevels[i].order == order)
+        {
+         g_orderLevels[i].hash  = Hash8(key);
+         g_orderLevels[i].price = price;
+         return;
+        }
+   int k = ArraySize(g_orderLevels);
+   ArrayResize(g_orderLevels, k + 1);
+   g_orderLevels[k].order = order;
+   g_orderLevels[k].hash  = Hash8(key);
+   g_orderLevels[k].price = price;
+  }
+
+string OrderLevelHash(const ulong order)
+  {
+   for(int i = 0; i < ArraySize(g_orderLevels); i++)
+      if(g_orderLevels[i].order == order)
+         return(g_orderLevels[i].hash);
+   return("");
   }
 
 void LinkTicket(const ulong ticket, const string key)
@@ -2084,23 +2161,35 @@ bool CloseOppositePositions(const int dir)
 //+------------------------------------------------------------------+
 //| Daily statistics and the daily loss stop                         |
 //+------------------------------------------------------------------+
-void AddLoss(const string hash, const double price)
+void AddLoss(const string hash, const double price, const datetime time)
   {
    int k = ArraySize(g_losses);
    ArrayResize(g_losses, k + 1);
    g_losses[k].hash  = hash;
    g_losses[k].price = price;
+   g_losses[k].time  = time;
   }
 
 // losing trades today on this level: same hash (any merged member) and an entry near the level's price,
 // so a positional indicator name that now holds another pivot is not locked by the old one's loss
 int LevelLossesToday(const SLevel &L)
   {
-   double tol = 2.0 * g_zone + Pts(InpPendingOffsetPoints);
+   // widest entry the signal logic can produce from the level (bounce zone, break window,
+   // pending offset, spread / slippage)
+   double maxEntry = (InpMaxEntryDistanceATR > 0.0 && g_atr > 0.0) ? InpMaxEntryDistanceATR * g_atr : BreakBuffer();
+   double tol = MathMax(2.0 * g_zone, BreakBuffer() + maxEntry)
+                + Pts(InpPendingOffsetPoints) + Pts(MathMax(InpMaxSpreadPoints, InpDeviationPoints));
    int n = 0;
    for(int i = 0; i < ArraySize(g_losses); i++)
      {
-      if(g_losses[i].price > 0.0 && MathAbs(g_losses[i].price - L.price) > tol)
+      double ref = L.price;
+      if(L.kind == 1 && g_losses[i].time > 0)          // a sloped line: its value when the trade was opened
+        {
+         double v = 0.0;
+         if(SlopedLevelValue(L, g_losses[i].time, v))
+            ref = v;
+        }
+      if(g_losses[i].price > 0.0 && MathAbs(g_losses[i].price - ref) > tol)
          continue;
       string probe = "|" + g_losses[i].hash;
       if(CommentMatchesLevel(probe, L))
@@ -2125,9 +2214,10 @@ void UpdateDailyStats(const bool scanHistory)
       g_dayTrades    = 0;
       g_consecLosses = 0;
       ArrayResize(g_losses, 0);
-      ulong  posIds[];                                  // position id -> level hash / entry price (from entry deals)
+      ulong  posIds[];                                  // position id -> level hash / entry price / time (from entry deals)
       string posHash[];
       double posPrice[];
+      datetime posTime[];
       ulong  unresolved[];                              // losing positions whose entry deal is older than the window
       if(HistorySelect(dayStart - 3 * 86400, now + 86400))
         {
@@ -2148,15 +2238,20 @@ void UpdateDailyStats(const bool scanHistory)
               {
                string c = StringSubstr(HistoryDealGetString(deal, DEAL_COMMENT), 0, 64);
                int bar = StringFind(c, "|");
-               if(bar >= 0 && StringLen(c) >= bar + 9)
+               string hash = (bar >= 0 && StringLen(c) >= bar + 9) ? StringSubstr(c, bar + 1, 8) : "";
+               if(hash == "")                           // comment stripped by the broker: our own memory
+                  hash = OrderLevelHash((ulong)HistoryDealGetInteger(deal, DEAL_ORDER));
+               if(hash != "")
                  {
                   int k = ArraySize(posIds);
                   ArrayResize(posIds, k + 1);
                   ArrayResize(posHash, k + 1);
                   ArrayResize(posPrice, k + 1);
+                  ArrayResize(posTime, k + 1);
                   posIds[k]   = posId;
-                  posHash[k]  = StringSubstr(c, bar + 1, 8);
+                  posHash[k]  = hash;
                   posPrice[k] = HistoryDealGetDouble(deal, DEAL_PRICE);
+                  posTime[k]  = dealTime;
                  }
               }
             if(dealTime < dayStart)
@@ -2176,7 +2271,7 @@ void UpdateDailyStats(const bool scanHistory)
                   for(int k = 0; k < ArraySize(posIds); k++)
                      if(posIds[k] == posId)
                        {
-                        AddLoss(posHash[k], posPrice[k]);  // every level that filled into this position
+                        AddLoss(posHash[k], posPrice[k], posTime[k]);  // every level that filled into this position
                         found = true;
                        }
                   if(!found)
@@ -2204,8 +2299,11 @@ void UpdateDailyStats(const bool scanHistory)
                continue;
             string c = StringSubstr(HistoryDealGetString(dl, DEAL_COMMENT), 0, 64);
             int bar = StringFind(c, "|");
-            if(bar >= 0 && StringLen(c) >= bar + 9)
-               AddLoss(StringSubstr(c, bar + 1, 8), HistoryDealGetDouble(dl, DEAL_PRICE));
+            string hash = (bar >= 0 && StringLen(c) >= bar + 9) ? StringSubstr(c, bar + 1, 8) : "";
+            if(hash == "")
+               hash = OrderLevelHash((ulong)HistoryDealGetInteger(dl, DEAL_ORDER));
+            if(hash != "")
+               AddLoss(hash, HistoryDealGetDouble(dl, DEAL_PRICE), (datetime)HistoryDealGetInteger(dl, DEAL_TIME));
            }
         }
       g_lastHistoryScan = now;
@@ -2799,6 +2897,7 @@ bool TryOpen(SLevel &L, const int dir, const string reason, const int touchBar, 
    if(g_trade.ResultDeal() != 0)
       LinkTicket(g_trade.ResultDeal(), L.key);
    double fill = (g_trade.ResultPrice() > 0.0) ? g_trade.ResultPrice() : entry;
+   RememberOrderLevel(ticket, L.key, fill);
    L.lastSignalTime = SignalBarTime(0);
    L.needReset = true;
    L.trades++;
@@ -2888,19 +2987,28 @@ void UpdateLevelRoles(const double closePrice)
      }
   }
 
-// per tick: which side of the zone price last was on, touch episodes, re-arming
+// per tick: which side of the level price last was on, touch episodes, re-arming.
+// The side is judged at the boundary each mode actually uses: beyond max(zone, break buffer)
+// for breakouts; for bounces the far side of a level is the tolerated pierce max(zone, maxPen),
+// the near side stays the zone.
 void UpdateLevelTicks(const double bid)
   {
-   double rearm = g_zone + RearmDistance();
+   double rearm  = g_zone + RearmDistance();
+   double maxPen = (InpMaxPenetrationATR > 0.0 && g_atr > 0.0) ? InpMaxPenetrationATR * g_atr : 0.0;
+   double deep   = MathMax(g_zone, maxPen);
+   double edge   = (InpDirectionMode == LT_DIR_BREAKOUT) ? MathMax(g_zone, BreakBuffer()) : g_zone;
    for(int i = 0; i < ArraySize(g_levels); i++)
      {
       double d = bid - g_levels[i].price;
-      if(d > g_zone)
+      int    r = g_levels[i].role;
+      double upEdge = (InpDirectionMode == LT_DIR_BOUNCE && r < 0) ? deep : edge;   // above a resistance = pierce
+      double dnEdge = (InpDirectionMode == LT_DIR_BOUNCE && r > 0) ? deep : edge;   // below a support = pierce
+      if(d > upEdge)
         {
          g_levels[i].lastSide = 1;
          g_levels[i].inTouch = false;
         }
-      else if(d < -g_zone)
+      else if(d < -dnEdge)
         {
          g_levels[i].lastSide = -1;
          g_levels[i].inTouch = false;
@@ -2932,8 +3040,12 @@ void CheckTouchSignals()
       string reason = "";
       if(InpDirectionMode == LT_DIR_BOUNCE)
         {
-         if(MathAbs(d) > g_zone)
-            continue;                                // outside the zone: no touch
+         bool inZone  = (MathAbs(d) <= g_zone);
+         bool pierced = (maxPen > g_zone)             // a tolerated pierce through the level keeps the episode alive
+                        && ((g_levels[i].role > 0 && d < 0.0 && -d <= maxPen)
+                            || (g_levels[i].role < 0 && d > 0.0 && d <= maxPen));
+         if(!inZone && !pierced)
+            continue;                                // outside the zone and not a tolerated pierce
          if(g_levels[i].role == 0 || g_levels[i].lastSide != g_levels[i].role)
             continue;                                // price must arrive from the role's side
          if(!g_levels[i].inTouch)
@@ -2944,6 +3056,8 @@ void CheckTouchSignals()
          else if((g_levels[i].role > 0 && bid < g_levels[i].touchExtreme)
                  || (g_levels[i].role < 0 && bid > g_levels[i].touchExtreme))
             g_levels[i].touchExtreme = bid;
+         if(!inZone)
+            continue;                                // trade only once price is back inside the zone
          if(!LevelArmed(g_levels[i]))
             continue;
          if(maxPen > 0.0 && ((g_levels[i].role > 0 && g_levels[i].touchExtreme < lv - maxPen)
@@ -3051,6 +3165,8 @@ void CheckBarSignals()
 //+------------------------------------------------------------------+
 void ManagePositions()
   {
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+      return;                                        // dry run: never modify real positions
    if(InpBreakEvenTriggerPoints <= 0 && InpTrailingStartPoints <= 0)
       return;
    double minDist = MinStopDistance();
@@ -3206,7 +3322,10 @@ bool PlacePending(SLevel &L, const int type)
    EnforceStopDistances(dir, price, sl, tp);
    double lots = ComputeLots(price, sl);
    if(lots <= 0.0)
+     {
+      L.pendingBar = SignalBarTime(0);               // sizing failed: retry next bar, not next tick
       return(false);
+     }
    if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
      {
       L.pendingBar = SignalBarTime(0);
@@ -3215,7 +3334,10 @@ bool PlacePending(SLevel &L, const int type)
       return(false);
      }
    if(!MarginOK(dir, lots, price))
+     {
+      L.pendingBar = SignalBarTime(0);               // no free margin: retry next bar, not next tick
       return(false);
+     }
    datetime expiry = PendingExpiration();
    ENUM_ORDER_TYPE_TIME tt = (expiry > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
    string comment = LevelComment(L.key);
@@ -3239,6 +3361,7 @@ bool PlacePending(SLevel &L, const int type)
    L.pendingType   = type;
    L.pendingBar    = SignalBarTime(0);
    LinkTicket(L.pendingTicket, L.key);
+   RememberOrderLevel(L.pendingTicket, L.key, price);
    Notify("placed " + EnumToString((ENUM_ORDER_TYPE)type) + " " + DoubleToString(lots, 2) + " @ " + PriceStr(price)
           + " level " + L.label + " SL " + PriceStr(sl) + " TP " + (tp > 0.0 ? PriceStr(tp) : "none"));
    return(true);
@@ -3292,6 +3415,9 @@ void OnPendingGone(SLevel &L)
       g_signalsThisBar++;
       g_dayTrades++;
       g_stateDirty = true;
+      int    ot   = (L.pendingType >= 0) ? L.pendingType : (int)HistoryOrderGetInteger(L.pendingTicket, ORDER_TYPE);
+      double fill = HistoryOrderGetDouble(L.pendingTicket, ORDER_PRICE_OPEN);
+      DrawMarker(PendingDir(ot), (fill > 0.0) ? fill : L.price, L.label + " pending fill", L.pendingTicket);
       Notify("order #" + IntegerToString((long)L.pendingTicket) + " on " + L.label + " filled");
      }
    else
@@ -3321,6 +3447,12 @@ void MaintainPendingOrders(const bool newBar)
          ulong ticket = OrderGetTicket(o);
          if(ticket == 0 || !IsOurOrder())
             continue;
+         bool held = false;                           // never claim a ticket another level holds
+         for(int k = 0; k < ArraySize(g_levels) && !held; k++)
+            if(k != i && g_levels[k].pendingTicket == ticket)
+               held = true;
+         if(held)
+            continue;
          string lk = LinkedKey(ticket);
          bool mine = (lk != "" && (lk == g_levels[i].key || IsMember(g_levels[i], lk)))
                      || CommentMatchesLevel(OrderGetString(ORDER_COMMENT), g_levels[i]);
@@ -3332,6 +3464,26 @@ void MaintainPendingOrders(const bool newBar)
             g_levels[i].pendingBar = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
          LinkTicket(ticket, g_levels[i].key);
          break;
+        }
+     }
+   //--- one owner per ticket (safety net for clusters that split or re-keyed)
+   for(int i = 0; i < ArraySize(g_levels); i++)
+     {
+      ulong t = g_levels[i].pendingTicket;
+      if(t == 0)
+         continue;
+      string lk = LinkedKey(t);
+      bool iOwns = (lk != "" && (lk == g_levels[i].key || IsMember(g_levels[i], lk)));
+      for(int j = i + 1; j < ArraySize(g_levels); j++)
+        {
+         if(g_levels[j].pendingTicket != t)
+            continue;
+         bool jOwns = (lk != "" && (lk == g_levels[j].key || IsMember(g_levels[j], lk)));
+         int drop = (jOwns && !iOwns) ? i : j;
+         g_levels[drop].pendingTicket = 0;
+         g_levels[drop].pendingType   = -1;
+         if(drop == i)
+            break;
         }
      }
    //--- orphans and manual expiry (never while a level source is still warming up)
@@ -3382,6 +3534,7 @@ void MaintainPendingOrders(const bool newBar)
       bool hasOrder = (g_levels[i].pendingTicket != 0 && OrderSelect(g_levels[i].pendingTicket));
       if(hasOrder)
         {
+         LinkTicket(g_levels[i].pendingTicket, g_levels[i].key);   // the link always names the current owner
          int type = (int)OrderGetInteger(ORDER_TYPE);
          string conflict = "";
          bool wrong = (desired < 0) || (type != desired) || capReached
@@ -3646,6 +3799,9 @@ bool ValidateInputs()
       LTLog(0, "InpMagic must not be 0");
       ok = false;
      }
+   if(InpEntryMode == LT_ENTRY_TOUCH && InpDirectionMode == LT_DIR_BREAKOUT
+      && (InpBreakoutBufferPoints > InpTouchZonePoints || InpBreakoutBufferATRFraction > InpZoneATRFraction))
+      LTLog(1, "note: the break buffer exceeds the touch zone - the breakout side is judged at the buffer");
    if(InpUseTimeFilter && (InpStartHour < 0 || InpStartHour > 23 || InpEndHour < 0 || InpEndHour > 24))
      {
       LTLog(0, "trading hours must be 0..23 (start) and 0..24 (end)");
@@ -3683,6 +3839,19 @@ bool ValidateInputs()
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   //--- transient state must not survive a chart or parameter change (the EA is not reloaded)
+   g_atr       = 0.0;
+   g_atrBar    = 0;
+   g_zone      = 0.0;
+   g_valReady  = true;
+   g_stateDirty = false;
+   g_savedAt   = 0;
+   g_signalsThisBar = 0;
+   g_lastObjScan = 0;
+   g_lastHistoryScan = 0;
+   g_lastDashboard = 0;
+   g_consecLosses = 0;
+   ArrayResize(g_orderLevels, 0);
    g_point     = _Point;
    g_digits    = _Digits;
    g_tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -3843,7 +4012,7 @@ void OnTick()
       g_lastBarTime = barTime;
       g_signalsThisBar = 0;
      }
-   if(newBar || g_atr <= 0.0)
+   if(newBar || g_atr <= 0.0 || g_atrBar != barTime)   // retry inside the bar until the ATR is read
      {
       UpdateATR();
       UpdateZone();
