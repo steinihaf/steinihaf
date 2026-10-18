@@ -321,7 +321,7 @@ struct SLevel
    color    clr;
    int      grade;          // ENUM_LT_GRADE
    bool     targetOnly;     // usable as a take-profit target, never for entries
-   string   members;        // keys of every level merged into this one, ';' separated
+   string   members;        // keys of every level merged into this one, as ";key;key;"
    // geometry
    double   price;          // value at the current bar
    double   prevPrice;      // value at the previous (completed) signal bar
@@ -564,6 +564,14 @@ bool CommentMatchesKey(const string comment, const string key)
    if(comment == "" || key == "")
       return(false);
    return(StringFind(comment, "|" + Hash8(key)) >= 0);
+  }
+
+// is the key one of the levels merged into L?
+bool IsMember(const SLevel &L, const string key)
+  {
+   if(key == "" || L.members == "")
+      return(false);
+   return(StringFind(L.members, ";" + key + ";") >= 0);
   }
 
 // does a comment hash belong to this level or to any level merged into it?
@@ -1633,7 +1641,7 @@ void MergeLevels(SLevel &src[], SLevel &out[])
             keep = k;
       if(keep >= 0 && keep != best)
          L.key = src[keep].key;
-      L.members = "";
+      L.members = ";";
       for(int k = i; k < j; k++)
         {
          L.members += src[k].key + ";";
@@ -1710,8 +1718,7 @@ void RebuildLevels()
       int old = FindLevelByKey(g_levels, merged[i].key);
       if(old < 0)                                      // a member of the cluster may carry the state
          for(int o = 0; o < ArraySize(g_levels) && old < 0; o++)
-            if(StringFind(merged[i].members, g_levels[o].key + ";") >= 0
-               || StringFind(g_levels[o].members, merged[i].key + ";") >= 0)
+            if(IsMember(merged[i], g_levels[o].key) || IsMember(g_levels[o], merged[i].key))
                old = o;
       if(old >= 0)
         {
@@ -1999,7 +2006,7 @@ bool SelectedPositionIsLevel(const SLevel &L)
    ulong ident  = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
    for(int i = 0; i < ArraySize(g_links); i++)
      {
-      if(g_links[i].key != L.key && (L.members == "" || StringFind(L.members, g_links[i].key + ";") < 0))
+      if(g_links[i].key != L.key && !IsMember(L, g_links[i].key))
          continue;
       if(g_links[i].ticket == ticket || g_links[i].ticket == ident)
          return(true);
@@ -3315,7 +3322,7 @@ void MaintainPendingOrders(const bool newBar)
          if(ticket == 0 || !IsOurOrder())
             continue;
          string lk = LinkedKey(ticket);
-         bool mine = (lk != "" && (lk == g_levels[i].key || StringFind(g_levels[i].members, lk + ";") >= 0))
+         bool mine = (lk != "" && (lk == g_levels[i].key || IsMember(g_levels[i], lk)))
                      || CommentMatchesLevel(OrderGetString(ORDER_COMMENT), g_levels[i]);
          if(!mine)
             continue;
