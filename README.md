@@ -27,7 +27,8 @@ tools/mqlcheck/                                      g++-based syntax check used
    "Algo Trading" button and the EA's *Allow Algo Trading* box).
 5. Load a preset with the *Load* button of the input dialog. For a first week, set
    `InpTradeMode` to *Signal only*: the EA then draws arrows and alerts instead of sending
-   orders, and the dashboard shows why signals were skipped.
+   orders (algo trading may stay disabled), never touches existing orders, and the
+   dashboard shows why signals were skipped.
 
 ## Where the levels come from
 
@@ -72,6 +73,9 @@ an entry. When levels merge, the cluster takes the best grade.
      `InpPendingMinDistancePoints` and `InpPendingMaxDistanceATR` x ATR away, re-priced
      every bar for sloped lines, deleted after `InpPendingExpiryBars`, when the role flips,
      or when a position cap or the opposite-position policy would be violated by a fill.
+     Resting orders count against `InpMaxOpenPositions` and the entry spacing, and an
+     order that expires or is deleted by hand marks its level *used*, so it is not placed
+     again until the level has re-armed.
 4. **Direction mode** (`InpDirectionMode`): *Bounce* trades the reaction off the level;
    *Breakout* trades the move through the level by the break buffer (sell below support,
    buy above resistance; pending mode then uses stop orders).
@@ -80,7 +84,7 @@ an entry. When levels merge, the cluster takes the best grade.
    `InpCooldownBars` bars have passed. A touch that could not be traded (spread, caps,
    filters) also marks the level used, so the EA never hammers a level on every tick.
    `InpMaxTradesPerLevel` caps a level for good; `InpMaxLossesPerLevelDay` (default 1)
-   disables a level for the rest of the day after it produced a losing trade.
+   disables a level for the rest of the day after it produced a losing trade at that price.
 6. **Caps and filters.** One new trade per bar, `InpMaxOpenPositions`, one position per
    level, `InpMinEntrySpacingPoints` from existing same-direction entries,
    opposite-position policy (skip / close first / hedge), max spread in points and as a
@@ -126,9 +130,12 @@ cooldown, chop, lost today, target only, wait side, order #...) and source. Entr
 drawn at every fill. All EA objects use the `LTEA_` prefix and are removed when the EA is
 taken off the chart (`InpDeleteObjectsOnExit`).
 
-Level state (role, cooldown, trade and flip counts) is saved to
-`MQL5\Files\LineTouchEA_<symbol>_<magic>.txt` and restored after a restart
-(`InpPersistState`; not in the tester).
+Level state (role, cooldown, trade and flip counts, with the level's price) is saved to
+`MQL5\Files\LineTouchEA_<symbol>_<magic>.txt` and restored after a restart for levels that
+are still at that price (`InpPersistState`; not in the tester; records older than seven days
+are dropped). A level whose price jumps by more than the zone (a new session's value-area
+line, a dragged line, an indicator name that now holds another pivot) starts over with a
+clean state.
 
 ## Backtesting
 

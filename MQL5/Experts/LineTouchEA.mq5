@@ -321,6 +321,7 @@ struct SLevel
    color    clr;
    int      grade;          // ENUM_LT_GRADE
    bool     targetOnly;     // usable as a take-profit target, never for entries
+   string   members;        // keys of every level merged into this one, ';' separated
    // geometry
    double   price;          // value at the current bar
    double   prevPrice;      // value at the previous (completed) signal bar
@@ -350,6 +351,7 @@ struct SLevel
    void     Reset()
      {
       key = ""; label = ""; source = 0; kind = 0; objName = ""; clr = clrWhite; grade = 0; targetOnly = false;
+      members = "";
       price = 0.0; prevPrice = 0.0; t1 = 0; p1 = 0.0; t2 = 0; p2 = 0.0; rayRight = true; rayLeft = false;
       role = 0; pendingRole = 0; pendingRoleCount = 0; lastSide = 0; inTouch = false; touchExtreme = 0.0;
       needReset = false; lastSignalTime = 0; trades = 0;
@@ -369,6 +371,7 @@ struct SLevel
 struct SSavedState            // level state restored from the state file
   {
    string   key;
+   double   price;
    int      role;
    bool     needReset;
    datetime lastSignalTime;
@@ -378,10 +381,10 @@ struct SSavedState            // level state restored from the state file
    datetime lastFlipTime;
   };
 
-struct SLossRecord            // losing trades today per level hash
+struct SLossRecord            // one losing trade today: level hash and entry price
   {
    string   hash;
-   int      losses;
+   double   price;
   };
 
 struct SPosLink              // open position / order  ->  level key
@@ -561,6 +564,21 @@ bool CommentMatchesKey(const string comment, const string key)
    if(comment == "" || key == "")
       return(false);
    return(StringFind(comment, "|" + Hash8(key)) >= 0);
+  }
+
+// does a comment hash belong to this level or to any level merged into it?
+bool CommentMatchesLevel(const string comment, const SLevel &L)
+  {
+   if(CommentMatchesKey(comment, L.key))
+      return(true);
+   if(L.members == "")
+      return(false);
+   string ks[];
+   int n = StringSplit(L.members, ';', ks);
+   for(int k = 0; k < n; k++)
+      if(ks[k] != "" && ks[k] != L.key && CommentMatchesKey(comment, ks[k]))
+         return(true);
+   return(false);
   }
 
 bool StartsWith(const string s, const string prefix)
@@ -822,7 +840,7 @@ void ScanChartObjects(SLevel &out[])
          L.source  = LT_SRC_OBJECT;
          L.objName = name;
          L.clr     = c;
-         L.grade   = LT_GRADE_A;
+         L.grade   = (StartsWith(name, "VAL_cur_D") || StartsWith(name, "VAL_fcst_")) ? LT_GRADE_C : LT_GRADE_A;
          if(k == 0)
            {
             L.kind      = 0;
@@ -914,8 +932,8 @@ void ReadValueAreaLevels(SLevel &out[])
       double v1 = buf[1];
       if(v0 == EMPTY_VALUE || v0 <= 0.0)
          continue;
-      if(v1 == EMPTY_VALUE || v1 <= 0.0)
-         v1 = v0;
+      if(v1 == EMPTY_VALUE || v1 <= 0.0 || barsIntoSession == 0)
+         v1 = v0;                                       // bar 1 belongs to the previous session: old line
       SLevel L;
       L.Reset();
       L.key       = "VAL:" + g_valNames[b];
@@ -1609,9 +1627,19 @@ void MergeLevels(SLevel &src[], SLevel &out[])
             allTargetOnly = false;
         }
       SLevel L = src[best];
+      int keep = -1;                                   // a member that already exists keeps the identity stable
+      for(int k = i; k < j && keep < 0; k++)
+         if(FindLevelByKey(g_levels, src[k].key) >= 0)
+            keep = k;
+      if(keep >= 0 && keep != best)
+         L.key = src[keep].key;
+      L.members = "";
       for(int k = i; k < j; k++)
+        {
+         L.members += src[k].key + ";";
          if(k != best)
             L.label += "+" + src[k].label;
+        }
       L.grade = bestGrade;
       L.targetOnly = allTargetOnly || (L.grade > (int)InpMinEntryGrade);
       AppendLevel(out, L);
@@ -1619,7 +1647,8 @@ void MergeLevels(SLevel &src[], SLevel &out[])
      }
   }
 
-// a level whose price jumped (developing value area at a session start, a dragged line) starts over
+// a level whose price jumped (developing value area at a session start, a dragged line,
+// a positional indicator name that now holds another pivot) is a new level: start over
 void ResetLevelDynamics(SLevel &L)
   {
    L.role = 0;
@@ -1628,6 +1657,13 @@ void ResetLevelDynamics(SLevel &L)
    L.lastSide = 0;
    L.inTouch = false;
    L.touchExtreme = 0.0;
+   L.needReset = false;
+   L.lastSignalTime = 0;
+   L.trades = 0;
+   L.flipCount = 0;
+   L.flipWindowStart = 0;
+   L.lastFlipTime = 0;
+   L.prevPrice = L.price;
   }
 
 bool ApplySavedState(SLevel &L)
@@ -1636,6 +1672,14 @@ bool ApplySavedState(SLevel &L)
      {
       if(g_saved[i].key != L.key)
          continue;
+      if(g_saved[i].price > 0.0 && MathAbs(g_saved[i].price - L.price) > g_zone)
+        {
+         int lastIdx = ArraySize(g_saved) - 1;          // saved for another price: discard
+         if(i != lastIdx)
+            g_saved[i] = g_saved[lastIdx];
+         ArrayResize(g_saved, lastIdx);
+         return(false);
+        }
       L.role            = g_saved[i].role;
       L.needReset       = g_saved[i].needReset;
       L.lastSignalTime  = g_saved[i].lastSignalTime;
@@ -1664,6 +1708,11 @@ void RebuildLevels()
    for(int i = 0; i < ArraySize(merged); i++)
      {
       int old = FindLevelByKey(g_levels, merged[i].key);
+      if(old < 0)                                      // a member of the cluster may carry the state
+         for(int o = 0; o < ArraySize(g_levels) && old < 0; o++)
+            if(StringFind(merged[i].members, g_levels[o].key + ";") >= 0
+               || StringFind(g_levels[o].members, merged[i].key + ";") >= 0)
+               old = o;
       if(old >= 0)
         {
          merged[i].CopyStateFrom(g_levels[old]);
@@ -1688,10 +1737,10 @@ string StateFileName()
    return("LineTouchEA_" + _Symbol + "_" + IntegerToString((long)InpMagic) + ".txt");
   }
 
-string StateLine(const string key, const int role, const bool needReset, const datetime lastSignalTime,
+string StateLine(const string key, const double price, const int role, const bool needReset, const datetime lastSignalTime,
                  const int trades, const int flipCount, const datetime flipWindowStart, const datetime lastFlipTime)
   {
-   return(key + "|" + IntegerToString(role) + "|" + (needReset ? "1" : "0") + "|"
+   return(key + "|" + PriceStr(price) + "|" + IntegerToString(role) + "|" + (needReset ? "1" : "0") + "|"
           + IntegerToString((long)lastSignalTime) + "|" + IntegerToString(trades) + "|"
           + IntegerToString(flipCount) + "|" + IntegerToString((long)flipWindowStart) + "|"
           + IntegerToString((long)lastFlipTime));
@@ -1716,14 +1765,19 @@ void SaveState()
       if(g_levels[i].trades == 0 && g_levels[i].lastSignalTime == 0 && g_levels[i].flipCount == 0
          && !g_levels[i].needReset && g_levels[i].role == 0)
          continue;
-      FileWriteString(h, StateLine(g_levels[i].key, g_levels[i].role, g_levels[i].needReset, g_levels[i].lastSignalTime,
-                                   g_levels[i].trades, g_levels[i].flipCount, g_levels[i].flipWindowStart,
-                                   g_levels[i].lastFlipTime) + "\r\n");
+      FileWriteString(h, StateLine(g_levels[i].key, g_levels[i].price, g_levels[i].role, g_levels[i].needReset,
+                                   g_levels[i].lastSignalTime, g_levels[i].trades, g_levels[i].flipCount,
+                                   g_levels[i].flipWindowStart, g_levels[i].lastFlipTime) + "\r\n");
      }
    for(int i = 0; i < ArraySize(g_saved); i++)        // levels not seen yet this session keep their saved state
-      FileWriteString(h, StateLine(g_saved[i].key, g_saved[i].role, g_saved[i].needReset, g_saved[i].lastSignalTime,
-                                   g_saved[i].trades, g_saved[i].flipCount, g_saved[i].flipWindowStart,
-                                   g_saved[i].lastFlipTime) + "\r\n");
+     {
+      datetime newest = (g_saved[i].lastSignalTime > g_saved[i].lastFlipTime) ? g_saved[i].lastSignalTime : g_saved[i].lastFlipTime;
+      if(newest > 0 && TimeCurrent() - newest > 7 * 86400)
+         continue;                                    // stale record: let it expire
+      FileWriteString(h, StateLine(g_saved[i].key, g_saved[i].price, g_saved[i].role, g_saved[i].needReset,
+                                   g_saved[i].lastSignalTime, g_saved[i].trades, g_saved[i].flipCount,
+                                   g_saved[i].flipWindowStart, g_saved[i].lastFlipTime) + "\r\n");
+     }
    FileClose(h);
   }
 
@@ -1755,18 +1809,24 @@ void LoadState()
      {
       string line = FileReadString(h);
       string f[];
-      if(StringSplit(line, '|', f) != 8)
+      if(StringSplit(line, '|', f) != 9)
          continue;
+      datetime lastSig  = (datetime)StringToInteger(f[4]);
+      datetime lastFlip = (datetime)StringToInteger(f[8]);
+      datetime newest   = (lastSig > lastFlip) ? lastSig : lastFlip;
+      if(newest > 0 && TimeCurrent() - newest > 7 * 86400)
+         continue;                                    // stale record
       int k = ArraySize(g_saved);
       ArrayResize(g_saved, k + 1);
       g_saved[k].key             = f[0];
-      g_saved[k].role            = (int)StringToInteger(f[1]);
-      g_saved[k].needReset       = (f[2] == "1");
-      g_saved[k].lastSignalTime  = (datetime)StringToInteger(f[3]);
-      g_saved[k].trades          = (int)StringToInteger(f[4]);
-      g_saved[k].flipCount       = (int)StringToInteger(f[5]);
-      g_saved[k].flipWindowStart = (datetime)StringToInteger(f[6]);
-      g_saved[k].lastFlipTime    = (datetime)StringToInteger(f[7]);
+      g_saved[k].price           = StringToDouble(f[1]);
+      g_saved[k].role            = (int)StringToInteger(f[2]);
+      g_saved[k].needReset       = (f[3] == "1");
+      g_saved[k].lastSignalTime  = lastSig;
+      g_saved[k].trades          = (int)StringToInteger(f[5]);
+      g_saved[k].flipCount       = (int)StringToInteger(f[6]);
+      g_saved[k].flipWindowStart = (datetime)StringToInteger(f[7]);
+      g_saved[k].lastFlipTime    = lastFlip;
      }
    FileClose(h);
    LTLog(1, "restored saved state for " + IntegerToString(ArraySize(g_saved)) + " levels");
@@ -1894,6 +1954,14 @@ string LinkedKey(const ulong ticket)
    return("");
   }
 
+// position id a filled order opened into (0 when unknown); works on netting accounts too
+ulong OrderPositionId(const ulong orderTicket)
+  {
+   if(!HistoryOrderSelect(orderTicket))
+      return(0);
+   return((ulong)HistoryOrderGetInteger(orderTicket, ORDER_POSITION_ID));
+  }
+
 // forget links of tickets that are neither open positions nor pending orders
 void PruneLinks()
   {
@@ -1909,6 +1977,11 @@ void PruneLinks()
                && (ulong)PositionGetInteger(POSITION_IDENTIFIER) == g_links[i].ticket)
                alive = true;
         }
+      if(!alive)
+        {
+         ulong pid = OrderPositionId(g_links[i].ticket);
+         alive = (pid != 0 && PositionSelectByTicket(pid));
+        }
       if(alive)
         {
          if(w != i)
@@ -1919,24 +1992,31 @@ void PruneLinks()
    ArrayResize(g_links, w);
   }
 
-// does the selected position belong to the level?
-bool SelectedPositionIsLevel(const string key)
+// does the selected position belong to the level (or to a level merged into it)?
+bool SelectedPositionIsLevel(const SLevel &L)
   {
    ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
    ulong ident  = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
-   if(LinkedKey(ticket) == key || LinkedKey(ident) == key)
-      return(true);
-   return(CommentMatchesKey(PositionGetString(POSITION_COMMENT), key));
+   for(int i = 0; i < ArraySize(g_links); i++)
+     {
+      if(g_links[i].key != L.key && (L.members == "" || StringFind(L.members, g_links[i].key + ";") < 0))
+         continue;
+      if(g_links[i].ticket == ticket || g_links[i].ticket == ident)
+         return(true);
+      if(OrderPositionId(g_links[i].ticket) == ident)     // netting: order filled into this position
+         return(true);
+     }
+   return(CommentMatchesLevel(PositionGetString(POSITION_COMMENT), L));
   }
 
-int CountLevelPositions(const string key)
+int CountLevelPositions(const SLevel &L)
   {
    int n = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       if(PositionGetTicket(i) == 0 || !IsOurPosition())
          continue;
-      if(SelectedPositionIsLevel(key))
+      if(SelectedPositionIsLevel(L))
          n++;
      }
    return(n);
@@ -1955,6 +2035,17 @@ bool EntrySpacingOK(const int dir, const double entry)
       if(pdir != dir)
          continue;
       if(MathAbs(PositionGetDouble(POSITION_PRICE_OPEN) - entry) < minDist)
+         return(false);
+     }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)           // resting orders reserve their price too
+     {
+      if(OrderGetTicket(i) == 0 || !IsOurOrder())
+         continue;
+      int type = (int)OrderGetInteger(ORDER_TYPE);
+      int odir = (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP) ? 1 : -1;
+      if(odir != dir)
+         continue;
+      if(MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - entry) < minDist)
          return(false);
      }
    return(true);
@@ -1986,27 +2077,29 @@ bool CloseOppositePositions(const int dir)
 //+------------------------------------------------------------------+
 //| Daily statistics and the daily loss stop                         |
 //+------------------------------------------------------------------+
-void AddLoss(const string hash)
+void AddLoss(const string hash, const double price)
   {
-   for(int i = 0; i < ArraySize(g_losses); i++)
-      if(g_losses[i].hash == hash)
-        {
-         g_losses[i].losses++;
-         return;
-        }
    int k = ArraySize(g_losses);
    ArrayResize(g_losses, k + 1);
-   g_losses[k].hash = hash;
-   g_losses[k].losses = 1;
+   g_losses[k].hash  = hash;
+   g_losses[k].price = price;
   }
 
-int LevelLossesToday(const string key)
+// losing trades today on this level: same hash (any merged member) and an entry near the level's price,
+// so a positional indicator name that now holds another pivot is not locked by the old one's loss
+int LevelLossesToday(const SLevel &L)
   {
-   string hash = Hash8(key);
+   double tol = 2.0 * g_zone + Pts(InpPendingOffsetPoints);
+   int n = 0;
    for(int i = 0; i < ArraySize(g_losses); i++)
-      if(g_losses[i].hash == hash)
-         return(g_losses[i].losses);
-   return(0);
+     {
+      if(g_losses[i].price > 0.0 && MathAbs(g_losses[i].price - L.price) > tol)
+         continue;
+      string probe = "|" + g_losses[i].hash;
+      if(CommentMatchesLevel(probe, L))
+         n++;
+     }
+   return(n);
   }
 
 void UpdateDailyStats(const bool scanHistory)
@@ -2025,8 +2118,10 @@ void UpdateDailyStats(const bool scanHistory)
       g_dayTrades    = 0;
       g_consecLosses = 0;
       ArrayResize(g_losses, 0);
-      ulong  posIds[];                                  // position id -> level hash (from entry deals)
+      ulong  posIds[];                                  // position id -> level hash / entry price (from entry deals)
       string posHash[];
+      double posPrice[];
+      ulong  unresolved[];                              // losing positions whose entry deal is older than the window
       if(HistorySelect(dayStart - 3 * 86400, now + 86400))
         {
          int total = HistoryDealsTotal();
@@ -2051,8 +2146,10 @@ void UpdateDailyStats(const bool scanHistory)
                   int k = ArraySize(posIds);
                   ArrayResize(posIds, k + 1);
                   ArrayResize(posHash, k + 1);
-                  posIds[k]  = posId;
-                  posHash[k] = StringSubstr(c, bar + 1, 8);
+                  ArrayResize(posPrice, k + 1);
+                  posIds[k]   = posId;
+                  posHash[k]  = StringSubstr(c, bar + 1, 8);
+                  posPrice[k] = HistoryDealGetDouble(deal, DEAL_PRICE);
                  }
               }
             if(dealTime < dayStart)
@@ -2068,16 +2165,40 @@ void UpdateDailyStats(const bool scanHistory)
                if(pl < 0.0)
                  {
                   g_consecLosses++;
+                  bool found = false;
                   for(int k = 0; k < ArraySize(posIds); k++)
                      if(posIds[k] == posId)
                        {
-                        AddLoss(posHash[k]);
-                        break;
+                        AddLoss(posHash[k], posPrice[k]);  // every level that filled into this position
+                        found = true;
                        }
+                  if(!found)
+                    {
+                     int u = ArraySize(unresolved);
+                     ArrayResize(unresolved, u + 1);
+                     unresolved[u] = posId;
+                    }
                  }
                else if(pl > 0.0)
                   g_consecLosses = 0;
               }
+           }
+        }
+      // entry deals older than the window: look the position up directly (replaces the selection)
+      for(int u = 0; u < ArraySize(unresolved); u++)
+        {
+         if(!HistorySelectByPosition(unresolved[u]))
+            continue;
+         int cnt = HistoryDealsTotal();
+         for(int d = 0; d < cnt; d++)
+           {
+            ulong dl = HistoryDealGetTicket(d);
+            if(dl == 0 || (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dl, DEAL_ENTRY) != DEAL_ENTRY_IN)
+               continue;
+            string c = StringSubstr(HistoryDealGetString(dl, DEAL_COMMENT), 0, 64);
+            int bar = StringFind(c, "|");
+            if(bar >= 0 && StringLen(c) >= bar + 9)
+               AddLoss(StringSubstr(c, bar + 1, 8), HistoryDealGetDouble(dl, DEAL_PRICE));
            }
         }
       g_lastHistoryScan = now;
@@ -2262,7 +2383,7 @@ bool OppositeConflict(const int dir, const int buys, const int sells, const bool
 // common checks for a new entry (market or pending); touchBar = bar whose range is checked
 bool EntryAllowed(const int dir, const SLevel &L, const bool marketOrder, const int touchBar, string &why)
   {
-   if(!TradingAllowed(why))
+   if(InpTradeMode == LT_MODE_LIVE && !TradingAllowed(why))
       return(false);
    if(!DirectionPermitted(dir))
      {
@@ -2302,12 +2423,14 @@ bool EntryAllowed(const int dir, const SLevel &L, const bool marketOrder, const 
    CountPositions(buys, sells);
    int same = (dir > 0) ? buys : sells;
    int counted = (InpOppositeMode == LT_OPP_CLOSE_FIRST && marketOrder) ? same : buys + sells;
+   if(!marketOrder)
+      counted += CountPendingOrders();                 // every resting order can fill in the same bar
    if(counted >= InpMaxOpenPositions)
      {
       why = "max open positions reached";
       return(false);
      }
-   if(InpMaxPositionsPerLevel > 0 && CountLevelPositions(L.key) >= InpMaxPositionsPerLevel)
+   if(InpMaxPositionsPerLevel > 0 && CountLevelPositions(L) >= InpMaxPositionsPerLevel)
      {
       why = "level already has a position";
       return(false);
@@ -2695,7 +2818,7 @@ bool LevelArmed(const SLevel &L)
       return(false);
    if(InpChopMaxFlips > 0 && L.flipCount >= InpChopMaxFlips && BarsSince(L.lastFlipTime) < InpChopWindowBars)
       return(false);
-   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L.key) >= InpMaxLossesPerLevelDay)
+   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L) >= InpMaxLossesPerLevelDay)
       return(false);
    return(true);
   }
@@ -2739,6 +2862,7 @@ void UpdateLevelRoles(const double closePrice)
         {
          g_levels[i].role = side;
          g_levels[i].pendingRoleCount = 0;
+         g_stateDirty = true;
          continue;
         }
       if(side == g_levels[i].role)
@@ -2775,7 +2899,10 @@ void UpdateLevelTicks(const double bid)
          g_levels[i].inTouch = false;
         }
       if(g_levels[i].needReset && MathAbs(d) > rearm)
+        {
          g_levels[i].needReset = false;
+         g_stateDirty = true;
+        }
      }
   }
 
@@ -2825,9 +2952,12 @@ void CheckTouchSignals()
         {
          if(!LevelArmed(g_levels[i]))
             continue;
-         if(g_levels[i].role > 0 && bid < lv - breakBuf)
+         if(g_levels[i].lastSide != g_levels[i].role)
+            continue;                                // price must have been on the role's side before the break
+         double maxBreak = breakBuf + ((InpMaxEntryDistanceATR > 0.0 && g_atr > 0.0) ? InpMaxEntryDistanceATR * g_atr : breakBuf);
+         if(g_levels[i].role > 0 && bid < lv - breakBuf && bid >= lv - maxBreak)
             dir = -1;
-         else if(g_levels[i].role < 0 && bid > lv + breakBuf)
+         else if(g_levels[i].role < 0 && bid > lv + breakBuf && bid <= lv + maxBreak)
             dir = 1;
          if(dir == 0)
             continue;
@@ -3011,6 +3141,8 @@ bool PendingPriceValid(const int type, const double price)
 
 bool DeletePending(const ulong ticket, const string why)
   {
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+      return(false);                                   // dry run: never touch real orders
    if(!g_trade.OrderDelete(ticket))
      {
       uint rc = g_trade.ResultRetcode();
@@ -3108,6 +3240,8 @@ bool PlacePending(SLevel &L, const int type)
 // re-price a resting order when the level moved (sloped lines, dragged lines)
 void UpdatePending(SLevel &L)
   {
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+      return;
    if(!OrderSelect(L.pendingTicket))
       return;
    int    type  = (int)OrderGetInteger(ORDER_TYPE);
@@ -3153,6 +3287,13 @@ void OnPendingGone(SLevel &L)
       g_stateDirty = true;
       Notify("order #" + IntegerToString((long)L.pendingTicket) + " on " + L.label + " filled");
      }
+   else
+     {
+      L.needReset = true;                              // expired or deleted: the level must re-arm first
+      L.lastSignalTime = SignalBarTime(0);
+      L.pendingBar = SignalBarTime(0);
+      g_stateDirty = true;
+     }
    L.pendingTicket = 0;
    L.pendingType   = -1;
   }
@@ -3173,8 +3314,9 @@ void MaintainPendingOrders(const bool newBar)
          ulong ticket = OrderGetTicket(o);
          if(ticket == 0 || !IsOurOrder())
             continue;
-         bool mine = (LinkedKey(ticket) == g_levels[i].key)
-                     || CommentMatchesKey(OrderGetString(ORDER_COMMENT), g_levels[i].key);
+         string lk = LinkedKey(ticket);
+         bool mine = (lk != "" && (lk == g_levels[i].key || StringFind(g_levels[i].members, lk + ";") >= 0))
+                     || CommentMatchesLevel(OrderGetString(ORDER_COMMENT), g_levels[i]);
          if(!mine)
             continue;
          g_levels[i].pendingTicket = ticket;
@@ -3208,8 +3350,17 @@ void MaintainPendingOrders(const bool newBar)
       if(InpPendingExpiryBars > 0 && !g_expirySupported)
         {
          datetime setup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
-         if(BarsSince(setup) >= InpPendingExpiryBars)
-            DeletePending(ticket, "expired");
+         if(BarsSince(setup) >= InpPendingExpiryBars && DeletePending(ticket, "expired"))
+            for(int i = 0; i < ArraySize(g_levels); i++)
+               if(g_levels[i].pendingTicket == ticket)
+                 {
+                  g_levels[i].pendingTicket = 0;
+                  g_levels[i].pendingType   = -1;
+                  g_levels[i].needReset     = true;
+                  g_levels[i].lastSignalTime = SignalBarTime(0);
+                  g_levels[i].pendingBar    = SignalBarTime(0);
+                  g_stateDirty = true;
+                 }
         }
      }
    //--- position caps: no resting orders while the cap is reached
@@ -3228,7 +3379,7 @@ void MaintainPendingOrders(const bool newBar)
          string conflict = "";
          bool wrong = (desired < 0) || (type != desired) || capReached
                       || OppositeConflict(PendingDir(type), buys, sells, false, conflict)
-                      || (InpMaxPositionsPerLevel > 0 && CountLevelPositions(g_levels[i].key) >= InpMaxPositionsPerLevel);
+                      || (InpMaxPositionsPerLevel > 0 && CountLevelPositions(g_levels[i]) >= InpMaxPositionsPerLevel);
          if(wrong)
            {
             if(DeletePending(g_levels[i].pendingTicket, capReached ? "position cap" : "level state changed"))
@@ -3262,7 +3413,7 @@ void RelinkPositions()
          continue;
       string comment = PositionGetString(POSITION_COMMENT);
       for(int k = 0; k < ArraySize(g_levels); k++)
-         if(CommentMatchesKey(comment, g_levels[k].key))
+         if(CommentMatchesLevel(comment, g_levels[k]))
            {
             LinkTicket(ticket, g_levels[k].key);
             break;
@@ -3305,7 +3456,7 @@ string LevelStateName(const SLevel &L)
       return("wait side");
    if(InpMaxTradesPerLevel > 0 && L.trades >= InpMaxTradesPerLevel)
       return("done");
-   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L.key) >= InpMaxLossesPerLevelDay)
+   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L) >= InpMaxLossesPerLevelDay)
       return("lost today");
    if(InpChopMaxFlips > 0 && L.flipCount >= InpChopMaxFlips && BarsSince(L.lastFlipTime) < InpChopWindowBars)
       return("chop");
