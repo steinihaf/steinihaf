@@ -21,6 +21,9 @@
 #property version     "1.00"
 #property description "Executes orders where price touches, rejects or breaks the levels on the chart."
 #property description "Reads chart lines, ValueAreaLevels buffers, built-in MTF ZigZag S/R and manual levels."
+// The Strategy Tester must bundle the indicator whose name comes from an input string.
+// Remove this line if you do not have ValueAreaLevels.ex5 and want to backtest without it.
+#property tester_indicator "ValueAreaLevels.ex5"
 
 #include <Trade/Trade.mqh>
 
@@ -109,6 +112,25 @@ enum ENUM_LT_LOG
    LT_LOG_VERBOSE = 2            // Everything (skipped signals, rescans)
   };
 
+enum ENUM_LT_GRADE
+  {
+   LT_GRADE_A = 0,               // A: higher-timeframe pivots, previous-session value area, manual, chart lines
+   LT_GRADE_B = 1,               // B: H4 pivots, D1 / H4 trend lines
+   LT_GRADE_C = 2                // C: H1 and faster pivots and trend lines, developing / forecast value area
+  };
+
+enum ENUM_LT_TRADE_MODE
+  {
+   LT_MODE_LIVE        = 0,      // Live: send orders
+   LT_MODE_SIGNAL_ONLY = 1       // Signal only: arrows and alerts, no orders (dry run)
+  };
+
+enum ENUM_LT_LOWRR
+  {
+   LT_LOWRR_SKIP       = 0,      // Skip the trade
+   LT_LOWRR_R_MULTIPLE = 1       // Use the R multiple target instead
+  };
+
 enum ENUM_LT_SOURCE
   {
    LT_SRC_OBJECT    = 0,
@@ -155,6 +177,7 @@ input ENUM_LT_VOLTYPE InpVAL_VolumeType = LT_VOL_TICK; // VAL: volume type
 input int    InpVAL_MaxSessions      = 60;            // VAL: max sessions back
 input int    InpVAL_BinPoints        = 0;             // VAL: bin size in points (0 = Auto)
 input int    InpVAL_ForecastSessions = 5;             // VAL: sessions in the forecast composite
+input int    InpVAL_DevelopingMinBars = 6;            // Developing levels are targets only for the first N bars of a session
 input bool   InpVAL_ExcludeObjects   = true;          // Skip VAL_ chart objects when buffers are used (no duplicates)
 
 input group "=== Level source 3: built-in MTF ZigZag S/R + trend lines ==="
@@ -173,26 +196,40 @@ input int    InpTL_Backstep          = 3;             // Trend-line ZigZag backs
 input int    InpSR_LookbackBars      = 1000;          // Bars analysed per timeframe
 input bool   InpSR_Draw              = true;          // Draw the computed lines on the chart
 
+input group "=== Trend line validity (all sloped lines) ==="
+input double InpTL_MaxExtensionRatio = 2.0;           // Ignore a line extended more than N x its anchor span (0 = off)
+input double InpTL_MaxSlopeATR       = 0.4;           // Ignore a line steeper than N x ATR per bar (0 = off)
+
 input group "=== Level source 4: manual ==="
 input string InpManualLevels         = "";            // Prices, e.g. 4343.31;4272.32;4155.23
 input string InpManualTrendLines     = "";            // Lines: yyyy.mm.dd hh:mi|price|yyyy.mm.dd hh:mi|price;...
 
 input group "=== Level handling ==="
-input int    InpMergeDistancePoints  = 50;            // Merge levels closer than N points (0 = off)
+input int    InpMergeDistancePoints  = 100;           // Merge levels closer than N points (0 = off)
+input ENUM_LT_GRADE InpMinEntryGrade = LT_GRADE_B;    // Lowest level grade allowed for entries (lower = targets only)
 
 input group "=== Signals ==="
 input ENUM_TIMEFRAMES InpSignalTF    = PERIOD_CURRENT; // Signal timeframe (Current = chart)
 input ENUM_LT_ENTRY_MODE InpEntryMode = LT_ENTRY_TOUCH; // Entry mode
 input ENUM_LT_DIRECTION_MODE InpDirectionMode = LT_DIR_BOUNCE; // Direction mode
 input ENUM_LT_TRADE_PERMIT InpTradePermit = LT_PERMIT_BOTH; // Allowed directions
-input int    InpTouchZonePoints      = 200;           // Touch zone around the level (points)
-input double InpZoneATRFraction      = 0.0;           // Zone = max(points, ATR x fraction) (0 = off)
-input int    InpATRPeriod            = 14;            // ATR period (zone / stop-loss)
-input double InpMinRejectionRatio    = 0.5;           // Confirm: min close position inside the bar range (0..1)
-input int    InpBreakoutBufferPoints = 100;           // Breakout: price must pass the level by N points
-input int    InpRearmPoints          = 200;           // Re-arm when price is N points outside the zone
+input int    InpTouchZonePoints      = 300;           // Touch zone around the level (points)
+input double InpZoneATRFraction      = 0.25;          // Zone = max(points, ATR x fraction) (0 = off)
+input int    InpATRPeriod            = 14;            // ATR period (zone / stop-loss / filters)
+input int    InpTouchRetreatPercent  = 30;            // Touch: wait until price retreats N% of the zone from its extreme (0 = immediate)
+input double InpMaxPenetrationATR    = 0.5;           // Bounce: ignore touches that pierced the level by more than N x ATR (0 = off)
+input double InpMinRejectionRatio    = 0.6;           // Confirm: min close position inside the bar range (0..1)
+input double InpMaxEntryDistanceATR  = 0.5;           // Confirm: skip when the entry is farther than N x ATR from the level (0 = off)
+input int    InpBreakoutBufferPoints = 200;           // Break buffer (points): close beyond level +/- buffer = through
+input double InpBreakoutBufferATRFraction = 0.15;     // Break buffer = max(points, ATR x fraction)
+input int    InpRoleConfirmBars      = 2;             // Closes beyond the break buffer needed to flip a level's role
+input int    InpChopWindowBars       = 24;            // Chop filter: window (bars)
+input int    InpChopMaxFlips         = 2;             // Chop filter: role flips inside the window that disable the level
+input int    InpRearmPoints          = 800;           // Re-arm distance outside the zone (points)
+input double InpRearmATRFraction     = 0.75;          // Re-arm distance = max(points, ATR x fraction)
 input int    InpCooldownBars         = 3;             // Bars between signals on the same level
 input int    InpMaxTradesPerLevel    = 0;             // Lifetime trades per level (0 = unlimited)
+input int    InpMaxLossesPerLevelDay = 1;             // Losing trades per level per day before it is disabled (0 = off)
 input int    InpMaxPositionsPerLevel = 1;             // Open positions per level
 input int    InpMaxOpenPositions     = 2;             // Open positions in total (this EA, this symbol)
 input int    InpMinEntrySpacingPoints = 300;          // Min distance from an existing same-direction entry
@@ -201,18 +238,28 @@ input bool   InpOneSignalPerBar      = true;          // At most one new trade p
 
 input group "=== Pending orders (entry mode = Pending) ==="
 input int    InpPendingOffsetPoints  = 20;            // Order price offset from the level (points)
-input int    InpPendingExpiryBars    = 24;            // Delete after N bars (0 = good till cancelled)
+input int    InpPendingExpiryBars    = 6;             // Delete after N bars (0 = good till cancelled)
 input int    InpPendingMinDistancePoints = 150;       // Do not place when the level is closer than N points
+input double InpPendingMaxDistanceATR = 1.5;          // Do not place when the level is farther than N x ATR (0 = off)
 input bool   InpPendingDeleteOrphans = true;          // Delete this EA's pending orders that match no level
 
 input group "=== Filters ==="
-input int    InpMaxSpreadPoints      = 350;           // Max spread (points, 0 = off)
+input int    InpMaxSpreadPoints      = 60;            // Max spread (points, 0 = off)
+input double InpMaxSpreadPercentOfSL = 8.0;           // Max spread as % of the stop distance (0 = off)
+input int    InpRolloverSkipMinutes  = 20;            // No new trades within N minutes of server midnight (0 = off)
 input bool   InpUseTimeFilter        = false;         // Use trading hours (server time)
 input int    InpStartHour            = 1;             // Trading start hour
 input int    InpEndHour              = 23;            // Trading end hour (exclusive)
 input int    InpFridayStopHour       = 0;             // No new trades on Friday from this hour (0 = off)
 input int    InpMaxTradesPerDay      = 0;             // Max new trades per day (0 = off)
-input double InpMaxDailyLossPercent  = 0.0;           // Stop for the day after losing N% of balance (0 = off)
+input double InpMaxDailyLossPercent  = 2.0;           // Stop for the day after losing N% of balance (0 = off)
+input int    InpMaxConsecutiveLosses = 3;             // Stop for the day after N losses in a row (0 = off)
+input double InpMaxImpulseATR        = 1.5;           // Bounce: skip when the last 3 bars moved more than N x ATR (0 = off)
+input double InpMaxBarRangeATR       = 2.0;           // Bounce: skip when the touching bar's range exceeds N x ATR (0 = off)
+input bool   InpUseADXFilter         = true;          // ADX regime: when trending, trade only with the trend
+input ENUM_TIMEFRAMES InpADXTF       = PERIOD_H4;     // ADX timeframe
+input int    InpADXPeriod            = 14;            // ADX period
+input double InpADXThreshold         = 30.0;          // ADX above this = trending
 input bool   InpUseMAFilter          = false;         // Trade only with the moving-average trend
 input int    InpMAPeriod             = 200;           // MA period
 input ENUM_MA_METHOD InpMAMethod     = MODE_EMA;      // MA method
@@ -221,18 +268,23 @@ input ENUM_TIMEFRAMES InpMATF        = PERIOD_CURRENT; // MA timeframe
 input group "=== Risk ==="
 input ENUM_LT_LOT_MODE InpLotMode    = LT_LOT_RISK_PERCENT; // Lot mode
 input double InpFixedLot             = 0.01;          // Fixed lot
-input double InpRiskPercent          = 1.0;           // Risk per trade (% of balance)
+input double InpRiskPercent          = 0.5;           // Risk per trade (% of balance)
 input bool   InpAllowMinLotOverRisk  = false;         // Use the minimum lot when the risk lot is smaller
 input ENUM_LT_SL_MODE InpSLMode      = LT_SL_BEYOND_LEVEL; // Stop-loss mode
-input int    InpSLBufferPoints       = 300;           // Stop-loss buffer beyond the level (points)
+input int    InpSLBufferPoints       = 500;           // Stop-loss buffer beyond the level (points)
+input double InpSLBufferATRFraction  = 0.5;           // Stop-loss buffer = max(points, ATR x fraction)
 input int    InpSLFixedPoints        = 800;           // Fixed stop-loss (points)
 input double InpSLATRMult            = 1.5;           // ATR multiple for the stop-loss
-input int    InpMaxSLPoints          = 1500;          // Skip the trade if the stop would be wider (0 = off)
+input int    InpMinSLPoints          = 300;           // Minimum stop distance (points)
+input int    InpMaxSLPoints          = 3000;          // Skip the trade if the stop would be wider (0 = off)
 input ENUM_LT_TP_MODE InpTPMode      = LT_TP_NEXT_LEVEL; // Take-profit mode
 input double InpTPRR                 = 1.5;           // R multiple
 input int    InpTPFixedPoints        = 1200;          // Fixed take-profit (points)
-input int    InpTPLevelBufferPoints  = 100;           // Take profit N points before the next level
+input int    InpTPLevelBufferPoints  = 150;           // Take profit N points before the next level
 input int    InpTPMinPoints          = 400;           // Next level must be at least N points away
+input double InpTPMinRR              = 1.2;           // Next level: minimum reward / risk (0 = off)
+input ENUM_LT_LOWRR InpTPLowRRAction = LT_LOWRR_SKIP; // Next level: when reward / risk is below the minimum
+input double InpTPMaxRR              = 3.0;           // Next level: cap the target at N R (0 = off)
 input int    InpBreakEvenTriggerPoints = 0;           // Move stop to break-even after N points (0 = off)
 input int    InpBreakEvenLockPoints  = 20;            // Break-even lock (points)
 input int    InpTrailingStartPoints  = 0;             // Start trailing after N points (0 = off)
@@ -240,6 +292,7 @@ input int    InpTrailingStopPoints   = 500;           // Trailing distance (poin
 input int    InpTrailingStepPoints   = 50;            // Trailing step (points)
 
 input group "=== Execution ==="
+input ENUM_LT_TRADE_MODE InpTradeMode = LT_MODE_LIVE; // Trade mode
 input ulong  InpMagic                = 20261017;      // Magic number
 input int    InpDeviationPoints      = 50;            // Max slippage (points)
 input string InpTradeComment         = "LT";          // Order comment prefix
@@ -249,6 +302,7 @@ input bool   InpShowDashboard        = true;          // Show the dashboard
 input int    InpDashboardLevels      = 12;            // Levels listed on the dashboard
 input bool   InpDrawMarkers          = true;          // Draw entry arrows
 input bool   InpDeleteObjectsOnExit  = true;          // Delete this EA's objects when removed
+input bool   InpPersistState         = true;          // Save level state to a file (survives restarts)
 input bool   InpAlerts               = false;         // Alert() on every trade
 input bool   InpPushNotifications    = false;         // Push notification on every trade
 input ENUM_LT_LOG InpLogLevel        = LT_LOG_NORMAL; // Log level
@@ -265,6 +319,8 @@ struct SLevel
    int      kind;           // 0 = horizontal, 1 = sloped (trend line)
    string   objName;        // chart object name (chart-object levels)
    color    clr;
+   int      grade;          // ENUM_LT_GRADE
+   bool     targetOnly;     // usable as a take-profit target, never for entries
    // geometry
    double   price;          // value at the current bar
    double   prevPrice;      // value at the previous (completed) signal bar
@@ -276,25 +332,56 @@ struct SLevel
    bool     rayLeft;
    // trading state (carried over between rebuilds by key)
    int      role;           // +1 support (below price), -1 resistance (above price), 0 unknown
+   int      pendingRole;    // opposite side seen on recent closes
+   int      pendingRoleCount;
+   int      lastSide;       // side of the zone price was last outside: +1 above, -1 below, 0 unknown
+   bool     inTouch;        // price is inside the zone (touch episode running)
+   double   touchExtreme;   // most adverse price seen during the touch episode
    bool     needReset;      // true after a signal until price has moved away again
-   datetime lastSignalTime; // signal-bar time of the last signal on this level
+   datetime lastSignalTime; // signal-bar time of the last signal (or role flip) on this level
    int      trades;         // lifetime trades on this level
+   int      flipCount;      // role flips inside the chop window
+   datetime flipWindowStart;
+   datetime lastFlipTime;
    ulong    pendingTicket;  // resting order ticket (pending mode)
    int      pendingType;    // ENUM_ORDER_TYPE of the resting order, -1 = none
    datetime pendingBar;     // signal-bar time when the order was last placed
 
    void     Reset()
      {
-      key = ""; label = ""; source = 0; kind = 0; objName = ""; clr = clrWhite;
+      key = ""; label = ""; source = 0; kind = 0; objName = ""; clr = clrWhite; grade = 0; targetOnly = false;
       price = 0.0; prevPrice = 0.0; t1 = 0; p1 = 0.0; t2 = 0; p2 = 0.0; rayRight = true; rayLeft = false;
-      role = 0; needReset = false; lastSignalTime = 0; trades = 0;
+      role = 0; pendingRole = 0; pendingRoleCount = 0; lastSide = 0; inTouch = false; touchExtreme = 0.0;
+      needReset = false; lastSignalTime = 0; trades = 0;
+      flipCount = 0; flipWindowStart = 0; lastFlipTime = 0;
       pendingTicket = 0; pendingType = -1; pendingBar = 0;
      }
    void     CopyStateFrom(const SLevel &o)
      {
-      role = o.role; needReset = o.needReset; lastSignalTime = o.lastSignalTime; trades = o.trades;
+      role = o.role; pendingRole = o.pendingRole; pendingRoleCount = o.pendingRoleCount;
+      lastSide = o.lastSide; inTouch = o.inTouch; touchExtreme = o.touchExtreme;
+      needReset = o.needReset; lastSignalTime = o.lastSignalTime; trades = o.trades;
+      flipCount = o.flipCount; flipWindowStart = o.flipWindowStart; lastFlipTime = o.lastFlipTime;
       pendingTicket = o.pendingTicket; pendingType = o.pendingType; pendingBar = o.pendingBar;
      }
+  };
+
+struct SSavedState            // level state restored from the state file
+  {
+   string   key;
+   int      role;
+   bool     needReset;
+   datetime lastSignalTime;
+   int      trades;
+   int      flipCount;
+   datetime flipWindowStart;
+   datetime lastFlipTime;
+  };
+
+struct SLossRecord            // losing trades today per level hash
+  {
+   string   hash;
+   int      losses;
   };
 
 struct SPosLink              // open position / order  ->  level key
@@ -357,7 +444,14 @@ bool            g_expirySupported = false;
 
 int             g_atrHandle    = INVALID_HANDLE;
 int             g_maHandle     = INVALID_HANDLE;
+int             g_adxHandle    = INVALID_HANDLE;
 int             g_valHandle    = INVALID_HANDLE;
+SSavedState     g_saved[];
+SLossRecord     g_losses[];
+int             g_consecLosses = 0;
+string          g_lastBlock    = "";
+ulong           g_signalSeq    = 0;
+bool            g_stateDirty   = false;
 double          g_atr          = 0.0;
 double          g_zone         = 0.0;   // current touch zone in price units
 
@@ -600,12 +694,37 @@ bool SlopedLevelValue(const SLevel &L, const datetime t, double &value)
    return(LineValueAt(L.t1, L.p1, L.t2, L.p2, t, value));
   }
 
+// over-extended (stale) or too steep lines are ignored; near-flat lines are never stale
+bool SlopedLineUsable(const SLevel &L)
+  {
+   double b1 = 0.0, b2 = 0.0;
+   if(!BarIndexOfTime(L.t1, b1) || !BarIndexOfTime(L.t2, b2))
+      return(false);
+   double span = MathAbs(b1 - b2);
+   if(span < 0.5)
+      return(false);
+   double rise  = MathAbs(L.p1 - L.p2);
+   double slope = rise / span;                          // price change per chart bar
+   bool   flat  = (rise <= g_zone * 0.1);
+   if(!flat && InpTL_MaxExtensionRatio > 0.0)
+     {
+      double sinceNewest = MathMin(b1, b2);             // bars since the newest anchor (negative = future)
+      if(sinceNewest > InpTL_MaxExtensionRatio * span)
+         return(false);
+     }
+   if(InpTL_MaxSlopeATR > 0.0 && g_atr > 0.0 && slope > InpTL_MaxSlopeATR * g_atr)
+      return(false);
+   return(true);
+  }
+
 // fills price (current bar) and prevPrice (previous signal bar) of a sloped level
 bool ComputeSlopedPrices(SLevel &L)
   {
    datetime tNow  = iTime(_Symbol, _Period, 0);
    datetime tPrev = SignalBarTime(1);
    if(tNow == 0)
+      return(false);
+   if(!SlopedLineUsable(L))
       return(false);
    double v0 = 0.0, v1 = 0.0;
    if(!SlopedLevelValue(L, tNow, v0))
@@ -692,6 +811,7 @@ void ScanChartObjects(SLevel &out[])
          L.source  = LT_SRC_OBJECT;
          L.objName = name;
          L.clr     = c;
+         L.grade   = LT_GRADE_A;
          if(k == 0)
            {
             L.kind      = 0;
@@ -754,6 +874,10 @@ void ReadValueAreaLevels(SLevel &out[])
       return;
    if(BarsCalculated(g_valHandle) < 2)
       return;
+   int barsIntoSession = 100000;
+   datetime sess = iTime(_Symbol, InpVAL_ProfilePeriod, 0);
+   if(sess > 0)
+      barsIntoSession = BarsSince(sess);
    for(int b = 0; b < LT_VAL_BUFFERS; b++)
      {
       if(!ValBufferEnabled(b))
@@ -777,6 +901,8 @@ void ReadValueAreaLevels(SLevel &out[])
       L.price     = v0;
       L.prevPrice = v1;
       L.clr       = ValBufferColor(b);
+      L.grade     = (b >= 3 && b <= 5) ? LT_GRADE_A : LT_GRADE_C;     // previous session = A, developing / forecast = C
+      L.targetOnly = (b <= 2 && barsIntoSession < InpVAL_DevelopingMinBars);
       AppendLevel(out, L);
      }
   }
@@ -1253,6 +1379,18 @@ void DrawEngineLines()
      }
   }
 
+int EngineGrade(const ENUM_TIMEFRAMES tf, const bool trendLine)
+  {
+   int ps = PeriodSeconds(tf);
+   if(ps >= PeriodSeconds(PERIOD_W1))
+      return(LT_GRADE_A);
+   if(ps >= PeriodSeconds(PERIOD_D1))
+      return(trendLine ? LT_GRADE_B : LT_GRADE_A);
+   if(ps >= PeriodSeconds(PERIOD_H4))
+      return(LT_GRADE_B);
+   return(LT_GRADE_C);
+  }
+
 void ReadEngineLevels(SLevel &out[])
   {
    for(int j = 0; j < ArraySize(g_eng); j++)
@@ -1273,6 +1411,7 @@ void ReadEngineLevels(SLevel &out[])
             L.prevPrice = L.price;
             int w = 1;
             L.clr       = EngineSRColor(g_eng[j].tf, w);
+            L.grade     = EngineGrade(g_eng[j].tf, false);
             AppendLevel(out, L);
            }
       if(g_eng[j].useTL)
@@ -1295,6 +1434,7 @@ void ReadEngineLevels(SLevel &out[])
             L.rayLeft  = false;
             ENUM_LINE_STYLE st = STYLE_DASH;
             L.clr      = EngineTLColor(g_eng[j].tf, st);
+            L.grade    = EngineGrade(g_eng[j].tf, true);
             if(!ComputeSlopedPrices(L))
                continue;
             AppendLevel(out, L);
@@ -1338,6 +1478,7 @@ void ReadManualLevels(SLevel &out[])
       L.price     = g_manualPrice[i];
       L.prevPrice = L.price;
       L.clr       = clrSilver;
+      L.grade     = LT_GRADE_A;
       AppendLevel(out, L);
      }
    for(int i = 0; i < ArraySize(g_manualTL); i++)
@@ -1361,6 +1502,7 @@ void ReadManualLevels(SLevel &out[])
       L.rayRight = true;
       L.rayLeft  = false;
       L.clr      = clrSilver;
+      L.grade    = LT_GRADE_A;
       if(L.t1 == 0 || L.t2 == 0 || L.p1 <= 0.0 || L.p2 <= 0.0 || L.t1 == L.t2)
         {
          LTLog(0, "manual trend line '" + g_manualTL[i] + "' has invalid anchors - ignored");
@@ -1379,12 +1521,18 @@ int SourceRank(const int source)
   {
    switch(source)
      {
-      case LT_SRC_OBJECT:    return(0);
-      case LT_SRC_VAL:       return(1);
+      case LT_SRC_VAL:       return(0);
+      case LT_SRC_OBJECT:    return(1);
       case LT_SRC_ENGINE_SR: return(2);
       case LT_SRC_ENGINE_TL: return(3);
      }
    return(4);
+  }
+
+// lower = better primary for a merged cluster: tradable first, then grade, then source
+int LevelPriority(const SLevel &L)
+  {
+   return((L.targetOnly ? 1000 : 0) + L.grade * 100 + SourceRank(L.source));
   }
 
 void SortLevelsByPrice(SLevel &arr[])
@@ -1416,18 +1564,61 @@ void MergeLevels(SLevel &src[], SLevel &out[])
       if(InpMergeDistancePoints > 0)
          while(j < n && src[j].price - src[i].price <= dist)
             j++;
-      // group [i, j): primary = best source rank, then lowest price
-      int best = i;
+      // group [i, j): primary = best priority, then lowest price
+      int  best = i;
+      int  bestGrade = src[i].grade;
+      bool allTargetOnly = src[i].targetOnly;
       for(int k = i + 1; k < j; k++)
-         if(SourceRank(src[k].source) < SourceRank(src[best].source))
+        {
+         if(LevelPriority(src[k]) < LevelPriority(src[best]))
             best = k;
+         if(src[k].grade < bestGrade)
+            bestGrade = src[k].grade;
+         if(!src[k].targetOnly)
+            allTargetOnly = false;
+        }
       SLevel L = src[best];
       for(int k = i; k < j; k++)
          if(k != best)
             L.label += "+" + src[k].label;
+      L.grade = bestGrade;
+      L.targetOnly = allTargetOnly || (L.grade > (int)InpMinEntryGrade);
       AppendLevel(out, L);
       i = j;
      }
+  }
+
+// a level whose price jumped (developing value area at a session start, a dragged line) starts over
+void ResetLevelDynamics(SLevel &L)
+  {
+   L.role = 0;
+   L.pendingRole = 0;
+   L.pendingRoleCount = 0;
+   L.lastSide = 0;
+   L.inTouch = false;
+   L.touchExtreme = 0.0;
+  }
+
+bool ApplySavedState(SLevel &L)
+  {
+   for(int i = 0; i < ArraySize(g_saved); i++)
+     {
+      if(g_saved[i].key != L.key)
+         continue;
+      L.role            = g_saved[i].role;
+      L.needReset       = g_saved[i].needReset;
+      L.lastSignalTime  = g_saved[i].lastSignalTime;
+      L.trades          = g_saved[i].trades;
+      L.flipCount       = g_saved[i].flipCount;
+      L.flipWindowStart = g_saved[i].flipWindowStart;
+      L.lastFlipTime    = g_saved[i].lastFlipTime;
+      int last = ArraySize(g_saved) - 1;
+      if(i != last)
+         g_saved[i] = g_saved[last];
+      ArrayResize(g_saved, last);
+      return(true);
+     }
+   return(false);
   }
 
 void RebuildLevels()
@@ -1443,13 +1634,111 @@ void RebuildLevels()
      {
       int old = FindLevelByKey(g_levels, merged[i].key);
       if(old >= 0)
+        {
          merged[i].CopyStateFrom(g_levels[old]);
+         if(MathAbs(merged[i].price - g_levels[old].price) > g_zone)
+            ResetLevelDynamics(merged[i]);
+        }
+      else
+         ApplySavedState(merged[i]);
      }
    ArrayResize(g_levels, ArraySize(merged));
    for(int i = 0; i < ArraySize(merged); i++)
       g_levels[i] = merged[i];
    g_lastObjScan = TimeCurrent();
    g_objDirty = false;
+  }
+
+//+------------------------------------------------------------------+
+//| State file: level state survives a restart (not in the tester)   |
+//+------------------------------------------------------------------+
+string StateFileName()
+  {
+   return("LineTouchEA_" + _Symbol + "_" + IntegerToString((long)InpMagic) + ".txt");
+  }
+
+string StateLine(const string key, const int role, const bool needReset, const datetime lastSignalTime,
+                 const int trades, const int flipCount, const datetime flipWindowStart, const datetime lastFlipTime)
+  {
+   return(key + "|" + IntegerToString(role) + "|" + (needReset ? "1" : "0") + "|"
+          + IntegerToString((long)lastSignalTime) + "|" + IntegerToString(trades) + "|"
+          + IntegerToString(flipCount) + "|" + IntegerToString((long)flipWindowStart) + "|"
+          + IntegerToString((long)lastFlipTime));
+  }
+
+void SaveState()
+  {
+   g_stateDirty = false;
+   if(!InpPersistState || g_isTester)
+      return;
+   int h = FileOpen(StateFileName(), FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+     {
+      LTLog(2, "cannot write the state file (error " + IntegerToString(GetLastError()) + ")");
+      return;
+     }
+   FileWriteString(h, "LTEA1|" + IntegerToString((long)TimeCurrent()) + "\r\n");
+   for(int i = 0; i < ArraySize(g_levels); i++)
+     {
+      if(StringFind(g_levels[i].key, "|") >= 0)
+         continue;
+      if(g_levels[i].trades == 0 && g_levels[i].lastSignalTime == 0 && g_levels[i].flipCount == 0
+         && !g_levels[i].needReset && g_levels[i].role == 0)
+         continue;
+      FileWriteString(h, StateLine(g_levels[i].key, g_levels[i].role, g_levels[i].needReset, g_levels[i].lastSignalTime,
+                                   g_levels[i].trades, g_levels[i].flipCount, g_levels[i].flipWindowStart,
+                                   g_levels[i].lastFlipTime) + "\r\n");
+     }
+   for(int i = 0; i < ArraySize(g_saved); i++)        // levels not seen yet this session keep their saved state
+      FileWriteString(h, StateLine(g_saved[i].key, g_saved[i].role, g_saved[i].needReset, g_saved[i].lastSignalTime,
+                                   g_saved[i].trades, g_saved[i].flipCount, g_saved[i].flipWindowStart,
+                                   g_saved[i].lastFlipTime) + "\r\n");
+   FileClose(h);
+  }
+
+void LoadState()
+  {
+   ArrayResize(g_saved, 0);
+   if(!InpPersistState || g_isTester)
+      return;
+   if(!FileIsExist(StateFileName()))
+      return;
+   int h = FileOpen(StateFileName(), FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+      return;
+   string header = FileReadString(h);
+   string hp[];
+   if(StringSplit(header, '|', hp) != 2 || hp[0] != "LTEA1")
+     {
+      FileClose(h);
+      return;
+     }
+   datetime savedAt = (datetime)StringToInteger(hp[1]);
+   if(TimeCurrent() - savedAt > 7 * 86400)
+     {
+      FileClose(h);
+      LTLog(1, "state file is older than 7 days - ignored");
+      return;
+     }
+   while(!FileIsEnding(h))
+     {
+      string line = FileReadString(h);
+      string f[];
+      if(StringSplit(line, '|', f) != 8)
+         continue;
+      int k = ArraySize(g_saved);
+      ArrayResize(g_saved, k + 1);
+      g_saved[k].key             = f[0];
+      g_saved[k].role            = (int)StringToInteger(f[1]);
+      g_saved[k].needReset       = (f[2] == "1");
+      g_saved[k].lastSignalTime  = (datetime)StringToInteger(f[3]);
+      g_saved[k].trades          = (int)StringToInteger(f[4]);
+      g_saved[k].flipCount       = (int)StringToInteger(f[5]);
+      g_saved[k].flipWindowStart = (datetime)StringToInteger(f[6]);
+      g_saved[k].lastFlipTime    = (datetime)StringToInteger(f[7]);
+     }
+   FileClose(h);
+   LTLog(1, "restored saved state for " + IntegerToString(ArraySize(g_saved)) + " levels");
   }
 
 //+------------------------------------------------------------------+
@@ -1481,6 +1770,30 @@ void UpdateZone()
    g_zone = Pts(InpTouchZonePoints);
    if(InpZoneATRFraction > 0.0 && g_atr > 0.0)
       g_zone = MathMax(g_zone, g_atr * InpZoneATRFraction);
+  }
+
+// every distance below = max(points, ATR x fraction)
+double ATRScaled(const int points, const double atrFraction)
+  {
+   double d = Pts(points);
+   if(atrFraction > 0.0 && g_atr > 0.0)
+      d = MathMax(d, g_atr * atrFraction);
+   return(d);
+  }
+
+double BreakBuffer()
+  {
+   return(ATRScaled(InpBreakoutBufferPoints, InpBreakoutBufferATRFraction));
+  }
+
+double RearmDistance()
+  {
+   return(ATRScaled(InpRearmPoints, InpRearmATRFraction));
+  }
+
+double SLBuffer()
+  {
+   return(ATRScaled(InpSLBufferPoints, InpSLBufferATRFraction));
   }
 
 int SpreadPoints()
@@ -1642,6 +1955,29 @@ bool CloseOppositePositions(const int dir)
 //+------------------------------------------------------------------+
 //| Daily statistics and the daily loss stop                         |
 //+------------------------------------------------------------------+
+void AddLoss(const string hash)
+  {
+   for(int i = 0; i < ArraySize(g_losses); i++)
+      if(g_losses[i].hash == hash)
+        {
+         g_losses[i].losses++;
+         return;
+        }
+   int k = ArraySize(g_losses);
+   ArrayResize(g_losses, k + 1);
+   g_losses[k].hash = hash;
+   g_losses[k].losses = 1;
+  }
+
+int LevelLossesToday(const string key)
+  {
+   string hash = Hash8(key);
+   for(int i = 0; i < ArraySize(g_losses); i++)
+      if(g_losses[i].hash == hash)
+         return(g_losses[i].losses);
+   return(0);
+  }
+
 void UpdateDailyStats(const bool scanHistory)
   {
    datetime now = TimeCurrent();
@@ -1654,9 +1990,13 @@ void UpdateDailyStats(const bool scanHistory)
      }
    if(scanHistory || newDay)
      {
-      g_dayRealized = 0.0;
-      g_dayTrades   = 0;
-      if(HistorySelect(dayStart, now + 86400))
+      g_dayRealized  = 0.0;
+      g_dayTrades    = 0;
+      g_consecLosses = 0;
+      ArrayResize(g_losses, 0);
+      ulong  posIds[];                                  // position id -> level hash (from entry deals)
+      string posHash[];
+      if(HistorySelect(dayStart - 3 * 86400, now + 86400))
         {
          int total = HistoryDealsTotal();
          for(int i = 0; i < total; i++)
@@ -1669,11 +2009,44 @@ void UpdateDailyStats(const bool scanHistory)
             if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol)
                continue;
             ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+            datetime dealTime = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+            ulong posId = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+            if(entry == DEAL_ENTRY_IN)
+              {
+               string c = StringSubstr(HistoryDealGetString(deal, DEAL_COMMENT), 0, 64);
+               int bar = StringFind(c, "|");
+               if(bar >= 0 && StringLen(c) >= bar + 9)
+                 {
+                  int k = ArraySize(posIds);
+                  ArrayResize(posIds, k + 1);
+                  ArrayResize(posHash, k + 1);
+                  posIds[k]  = posId;
+                  posHash[k] = StringSubstr(c, bar + 1, 8);
+                 }
+              }
+            if(dealTime < dayStart)
+               continue;
             if(entry == DEAL_ENTRY_IN)
                g_dayTrades++;
-            g_dayRealized += HistoryDealGetDouble(deal, DEAL_PROFIT)
-                             + HistoryDealGetDouble(deal, DEAL_COMMISSION)
-                             + HistoryDealGetDouble(deal, DEAL_SWAP);
+            double pl = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                        + HistoryDealGetDouble(deal, DEAL_COMMISSION)
+                        + HistoryDealGetDouble(deal, DEAL_SWAP);
+            g_dayRealized += pl;
+            if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT || entry == DEAL_ENTRY_OUT_BY)
+              {
+               if(pl < 0.0)
+                 {
+                  g_consecLosses++;
+                  for(int k = 0; k < ArraySize(posIds); k++)
+                     if(posIds[k] == posId)
+                       {
+                        AddLoss(posHash[k]);
+                        break;
+                       }
+                 }
+               else if(pl > 0.0)
+                  g_consecLosses = 0;
+              }
            }
         }
       g_lastHistoryScan = now;
@@ -1695,6 +2068,11 @@ void UpdateDailyStats(const bool scanHistory)
          LTLog(0, "daily loss limit reached (" + DoubleToString(g_dayRealized + g_dayFloating, 2)
                + ") - no new trades until the next day");
         }
+     }
+   if(InpMaxConsecutiveLosses > 0 && !g_dayStopped && g_consecLosses >= InpMaxConsecutiveLosses)
+     {
+      g_dayStopped = true;
+      LTLog(0, IntegerToString(g_consecLosses) + " losses in a row - no new trades until the next day");
      }
   }
 
@@ -1752,6 +2130,12 @@ bool TimeFilterOK()
    TimeToStruct(TimeCurrent(), dt);
    if(InpFridayStopHour > 0 && dt.day_of_week == 5 && dt.hour >= InpFridayStopHour)
       return(false);
+   if(InpRolloverSkipMinutes > 0)
+     {
+      int minuteOfDay = dt.hour * 60 + dt.min;
+      if(minuteOfDay >= 1440 - InpRolloverSkipMinutes || minuteOfDay < InpRolloverSkipMinutes)
+         return(false);
+     }
    if(!InpUseTimeFilter)
       return(true);
    if(InpStartHour == InpEndHour)
@@ -1775,8 +2159,77 @@ bool MAFilterOK(const int dir)
    return((dir > 0) ? (c > ma[0]) : (c < ma[0]));
   }
 
-// common checks for a new entry (market or pending)
-bool EntryAllowed(const int dir, const SLevel &L, string &why)
+bool ADXFilterOK(const int dir, string &why)
+  {
+   if(!InpUseADXFilter || g_adxHandle == INVALID_HANDLE)
+      return(true);
+   double adx[], pdi[], mdi[];
+   ArraySetAsSeries(adx, true);
+   ArraySetAsSeries(pdi, true);
+   ArraySetAsSeries(mdi, true);
+   if(CopyBuffer(g_adxHandle, 0, 1, 1, adx) != 1 || CopyBuffer(g_adxHandle, 1, 1, 1, pdi) != 1
+      || CopyBuffer(g_adxHandle, 2, 1, 1, mdi) != 1)
+     {
+      why = "ADX data not ready";
+      return(false);
+     }
+   if(adx[0] < InpADXThreshold)
+      return(true);
+   bool up = (pdi[0] > mdi[0]);
+   if((dir > 0) ? up : !up)
+      return(true);
+   why = "against the ADX trend";
+   return(false);
+  }
+
+// bounce entries are skipped when price slams into the level
+bool MomentumFilterOK(const int touchBar, string &why)
+  {
+   if(g_atr <= 0.0)
+      return(true);
+   if(InpMaxImpulseATR > 0.0)
+     {
+      double c1 = iClose(_Symbol, g_sigTF, 1);
+      double c4 = iClose(_Symbol, g_sigTF, 4);
+      if(c1 > 0.0 && c4 > 0.0 && MathAbs(c1 - c4) > InpMaxImpulseATR * g_atr)
+        {
+         why = "impulse move into the level";
+         return(false);
+        }
+     }
+   if(InpMaxBarRangeATR > 0.0)
+     {
+      double h = iHigh(_Symbol, g_sigTF, touchBar);
+      double l = iLow(_Symbol, g_sigTF, touchBar);
+      if(h > 0.0 && l > 0.0 && h - l > InpMaxBarRangeATR * g_atr)
+        {
+         why = "touching bar range too large";
+         return(false);
+        }
+     }
+   return(true);
+  }
+
+bool OppositeConflict(const int dir, const int buys, const int sells, const bool marketOrder, string &why)
+  {
+   int opposite = (dir > 0) ? sells : buys;
+   if(opposite == 0)
+      return(false);
+   if(InpOppositeMode == LT_OPP_HEDGE)
+     {
+      if(g_hedging)
+         return(false);
+      why = "opposite position open (netting account cannot hedge)";
+      return(true);
+     }
+   if(InpOppositeMode == LT_OPP_CLOSE_FIRST && marketOrder)
+      return(false);
+   why = "opposite position open";
+   return(true);
+  }
+
+// common checks for a new entry (market or pending); touchBar = bar whose range is checked
+bool EntryAllowed(const int dir, const SLevel &L, const bool marketOrder, const int touchBar, string &why)
   {
    if(!TradingAllowed(why))
       return(false);
@@ -1787,7 +2240,7 @@ bool EntryAllowed(const int dir, const SLevel &L, string &why)
      }
    if(g_dayStopped)
      {
-      why = "daily loss limit reached";
+      why = "stopped for the day (loss limit)";
       return(false);
      }
    if(InpMaxTradesPerDay > 0 && g_dayTrades >= InpMaxTradesPerDay)
@@ -1802,7 +2255,7 @@ bool EntryAllowed(const int dir, const SLevel &L, string &why)
      }
    if(!TimeFilterOK())
      {
-      why = "outside trading hours";
+      why = "outside trading hours / rollover";
       return(false);
      }
    if(!MAFilterOK(dir))
@@ -1810,9 +2263,15 @@ bool EntryAllowed(const int dir, const SLevel &L, string &why)
       why = "against the MA trend";
       return(false);
      }
+   if(!ADXFilterOK(dir, why))
+      return(false);
+   if(InpDirectionMode == LT_DIR_BOUNCE && !MomentumFilterOK(touchBar, why))
+      return(false);
    int buys = 0, sells = 0;
    CountPositions(buys, sells);
-   if(buys + sells >= InpMaxOpenPositions)
+   int same = (dir > 0) ? buys : sells;
+   int counted = (InpOppositeMode == LT_OPP_CLOSE_FIRST && marketOrder) ? same : buys + sells;
+   if(counted >= InpMaxOpenPositions)
      {
       why = "max open positions reached";
       return(false);
@@ -1822,20 +2281,8 @@ bool EntryAllowed(const int dir, const SLevel &L, string &why)
       why = "level already has a position";
       return(false);
      }
-   int opposite = (dir > 0) ? sells : buys;
-   if(opposite > 0)
-     {
-      if(InpOppositeMode == LT_OPP_SKIP)
-        {
-         why = "opposite position open";
-         return(false);
-        }
-      if(InpOppositeMode == LT_OPP_HEDGE && !g_hedging)
-        {
-         why = "opposite position open (netting account cannot hedge)";
-         return(false);
-        }
-     }
+   if(OppositeConflict(dir, buys, sells, marketOrder, why))
+      return(false);
    return(true);
   }
 
@@ -1848,7 +2295,7 @@ double ComputeSL(const int dir, const double entry, const double levelPrice)
    switch(InpSLMode)
      {
       case LT_SL_BEYOND_LEVEL:
-         sl = (dir > 0) ? levelPrice - Pts(InpSLBufferPoints) : levelPrice + Pts(InpSLBufferPoints);
+         sl = (dir > 0) ? levelPrice - SLBuffer() : levelPrice + SLBuffer();
          break;
       case LT_SL_ATR:
          if(g_atr > 0.0)
@@ -1864,6 +2311,9 @@ double ComputeSL(const int dir, const double entry, const double levelPrice)
    // a stop that would sit on the wrong side of the entry is pushed to the fixed distance
    if((dir > 0 && sl >= entry) || (dir < 0 && sl <= entry))
       sl = (dir > 0) ? entry - Pts(InpSLFixedPoints) : entry + Pts(InpSLFixedPoints);
+   double minSL = Pts(InpMinSLPoints);
+   if(minSL > 0.0 && MathAbs(entry - sl) < minSL)
+      sl = (dir > 0) ? entry - minSL : entry + minSL;
    return(RoundToTick(sl));
   }
 
@@ -1895,10 +2345,13 @@ double NextLevelPrice(const int dir, const double entry, const string skipKey)
    return(best);
   }
 
-double ComputeTP(const int dir, const double entry, const double sl, const SLevel &L)
+// returns the take-profit (0 = none); skip = true when the trade should not be taken at all
+double ComputeTP(const int dir, const double entry, const double sl, const SLevel &L, bool &skip, string &why)
   {
+   skip = false;
    double risk = MathAbs(entry - sl);
    double tp = 0.0;
+   double rTarget = (InpTPRR > 0.0) ? ((dir > 0) ? entry + risk * InpTPRR : entry - risk * InpTPRR) : 0.0;
    switch(InpTPMode)
      {
       case LT_TP_NONE:
@@ -1906,24 +2359,42 @@ double ComputeTP(const int dir, const double entry, const double sl, const SLeve
       case LT_TP_FIXED_POINTS:
          tp = (dir > 0) ? entry + Pts(InpTPFixedPoints) : entry - Pts(InpTPFixedPoints);
          break;
+      case LT_TP_RR:
+         tp = rTarget;
+         break;
       case LT_TP_NEXT_LEVEL:
         {
          double nxt = NextLevelPrice(dir, entry, L.key);
-         if(nxt > 0.0)
+         if(nxt <= 0.0)
            {
-            tp = (dir > 0) ? nxt - Pts(InpTPLevelBufferPoints) : nxt + Pts(InpTPLevelBufferPoints);
+            if(InpTPLowRRAction == LT_LOWRR_SKIP)
+              {
+               skip = true;
+               why = "no level to target";
+               return(0.0);
+              }
+            tp = rTarget;
             break;
            }
-         if(InpTPRR <= 0.0)
-            return(0.0);
-        }
-      // fallback: R multiple
-      default:
-         if(InpTPRR <= 0.0)
-            return(0.0);
-         tp = (dir > 0) ? entry + risk * InpTPRR : entry - risk * InpTPRR;
+         tp = (dir > 0) ? nxt - Pts(InpTPLevelBufferPoints) : nxt + Pts(InpTPLevelBufferPoints);
+         double rr = (risk > 0.0) ? MathAbs(tp - entry) / risk : 0.0;
+         if(InpTPMinRR > 0.0 && rr < InpTPMinRR)
+           {
+            if(InpTPLowRRAction == LT_LOWRR_SKIP)
+              {
+               skip = true;
+               why = "next level only " + DoubleToString(rr, 2) + "R away";
+               return(0.0);
+              }
+            tp = rTarget;
+           }
+         else if(InpTPMaxRR > 0.0 && rr > InpTPMaxRR)
+            tp = (dir > 0) ? entry + risk * InpTPMaxRR : entry - risk * InpTPMaxRR;
          break;
+        }
      }
+   if(tp <= 0.0)
+      return(0.0);
    return(RoundToTick(tp));
   }
 
@@ -2066,34 +2537,79 @@ void Notify(const string msg)
 //+------------------------------------------------------------------+
 //| Market entry                                                     |
 //+------------------------------------------------------------------+
-bool TryOpen(SLevel &L, const int dir, const string reason)
+void BlockSignal(SLevel &L, const string why)
+  {
+   g_lastBlock = L.label + ": " + why;
+   LTLog(2, "signal on " + L.label + " skipped: " + why);
+  }
+
+// touchBar = bar whose range the momentum filter checks (0 intrabar, 1 bar-close logic)
+bool TryOpen(SLevel &L, const int dir, const string reason, const int touchBar, const bool checkEntryDistance)
   {
    string why = "";
-   if(!EntryAllowed(dir, L, why))
+   if(!EntryAllowed(dir, L, true, touchBar, why))
      {
-      LTLog(2, "signal on " + L.label + " skipped: " + why);
+      BlockSignal(L, why);
       return(false);
      }
    double entry = (dir > 0) ? g_tick.ask : g_tick.bid;
+   if(checkEntryDistance && InpMaxEntryDistanceATR > 0.0 && g_atr > 0.0
+      && MathAbs(entry - L.price) > InpMaxEntryDistanceATR * g_atr)
+     {
+      BlockSignal(L, "entry too far from the level");
+      return(false);
+     }
    if(!EntrySpacingOK(dir, entry))
      {
-      LTLog(2, "signal on " + L.label + " skipped: too close to an existing entry");
+      BlockSignal(L, "too close to an existing entry");
       return(false);
      }
    double sl = ComputeSL(dir, entry, L.price);
-   if(InpMaxSLPoints > 0 && MathAbs(entry - sl) > Pts(InpMaxSLPoints))
+   double slDist = MathAbs(entry - sl);
+   if(InpMaxSLPoints > 0 && slDist > Pts(InpMaxSLPoints))
      {
-      LTLog(2, "signal on " + L.label + " skipped: stop " + DoubleToString(MathAbs(entry - sl) / g_point, 0)
-            + " pts > max " + IntegerToString(InpMaxSLPoints));
+      BlockSignal(L, "stop " + DoubleToString(slDist / g_point, 0) + " pts > max " + IntegerToString(InpMaxSLPoints));
       return(false);
      }
-   double tp = ComputeTP(dir, entry, sl, L);
+   if(InpMaxSpreadPercentOfSL > 0.0 && slDist > 0.0
+      && SpreadPoints() * g_point > slDist * InpMaxSpreadPercentOfSL / 100.0)
+     {
+      BlockSignal(L, "spread too large for the stop distance");
+      return(false);
+     }
+   bool skip = false;
+   double tp = ComputeTP(dir, entry, sl, L, skip, why);
+   if(skip)
+     {
+      BlockSignal(L, why);
+      return(false);
+     }
    EnforceStopDistances(dir, (dir > 0) ? g_tick.bid : g_tick.ask, sl, tp);
    double lots = ComputeLots(entry, sl);
    if(lots <= 0.0)
+     {
+      BlockSignal(L, "lot size");
       return(false);
+     }
+   string side = (dir > 0) ? "BUY" : "SELL";
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+     {
+      g_signalSeq++;
+      L.lastSignalTime = SignalBarTime(0);
+      L.needReset = true;
+      L.trades++;
+      g_signalsThisBar++;
+      g_stateDirty = true;
+      DrawMarker(dir, entry, L.label + " " + reason + " (signal only)", g_signalSeq);
+      Notify("SIGNAL ONLY: " + side + " " + DoubleToString(lots, 2) + " @ " + PriceStr(entry) + " level " + L.label
+             + " " + PriceStr(L.price) + " (" + reason + ") SL " + PriceStr(sl) + " TP " + (tp > 0.0 ? PriceStr(tp) : "none"));
+      return(true);
+     }
    if(!MarginOK(dir, lots, entry))
+     {
+      BlockSignal(L, "margin");
       return(false);
+     }
    int buys = 0, sells = 0;
    CountPositions(buys, sells);
    int opposite = (dir > 0) ? sells : buys;
@@ -2111,9 +2627,9 @@ bool TryOpen(SLevel &L, const int dir, const string reason)
    uint rc = g_trade.ResultRetcode();
    if(!sent || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED && rc != TRADE_RETCODE_DONE_PARTIAL))
      {
-      string side = (dir > 0) ? "BUY" : "SELL";
       LTLog(0, side + " on " + L.label + " failed: " + IntegerToString((int)rc)
             + " " + g_trade.ResultRetcodeDescription());
+      g_lastBlock = L.label + ": order rejected " + IntegerToString((int)rc);
       return(false);
      }
    ulong ticket = g_trade.ResultOrder();
@@ -2127,8 +2643,9 @@ bool TryOpen(SLevel &L, const int dir, const string reason)
    L.trades++;
    g_signalsThisBar++;
    g_dayTrades++;
+   g_stateDirty = true;
    DrawMarker(dir, fill, L.label + " " + reason, ticket);
-   Notify((dir > 0 ? "BUY " : "SELL ") + DoubleToString(lots, 2) + " @ " + PriceStr(fill)
+   Notify(side + " " + DoubleToString(lots, 2) + " @ " + PriceStr(fill)
           + " level " + L.label + " " + PriceStr(L.price) + " (" + reason + ") SL " + PriceStr(sl)
           + " TP " + (tp > 0.0 ? PriceStr(tp) : "none"));
    return(true);
@@ -2139,26 +2656,93 @@ bool TryOpen(SLevel &L, const int dir, const string reason)
 //+------------------------------------------------------------------+
 bool LevelArmed(const SLevel &L)
   {
-   if(L.role == 0 || L.needReset)
+   if(L.targetOnly || L.role == 0 || L.needReset)
       return(false);
    if(InpMaxTradesPerLevel > 0 && L.trades >= InpMaxTradesPerLevel)
       return(false);
    if(InpCooldownBars > 0 && BarsSince(L.lastSignalTime) < InpCooldownBars)
       return(false);
+   if(InpChopMaxFlips > 0 && L.flipCount >= InpChopMaxFlips && BarsSince(L.lastFlipTime) < InpChopWindowBars)
+      return(false);
+   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L.key) >= InpMaxLossesPerLevelDay)
+      return(false);
    return(true);
   }
 
-// refPrice: current Bid (intrabar logic) or the last completed close (bar logic)
-void UpdateLevelStates(const double refPrice)
+void RegisterFlip(SLevel &L, const int newRole)
   {
-   double rearm = g_zone + Pts(InpRearmPoints);
+   datetime now = SignalBarTime(0);
+   if(L.flipWindowStart == 0 || BarsSince(L.flipWindowStart) >= InpChopWindowBars)
+     {
+      L.flipWindowStart = now;
+      L.flipCount = 0;
+     }
+   L.flipCount++;
+   L.lastFlipTime = now;
+   L.lastSignalTime = now;                          // a flip starts the cooldown
+   L.role = newRole;
+   L.pendingRoleCount = 0;
+   L.inTouch = false;
+   g_stateDirty = true;
+   LTLog(2, "level " + L.label + " " + PriceStr(L.price) + " is now " + (newRole > 0 ? "support" : "resistance"));
+  }
+
+// roles come from completed closes only: a level is support while closes stay above it;
+// it flips after InpRoleConfirmBars consecutive closes beyond the break buffer on the other side
+void UpdateLevelRoles(const double closePrice)
+  {
+   if(closePrice <= 0.0)
+      return;
+   double buf = BreakBuffer();
+   int confirm = MathMax(InpRoleConfirmBars, 1);
    for(int i = 0; i < ArraySize(g_levels); i++)
      {
-      double d = refPrice - g_levels[i].price;
+      double d = closePrice - g_levels[i].prevPrice;
+      int side = (d > buf) ? 1 : ((d < -buf) ? -1 : 0);
+      if(side == 0)
+        {
+         g_levels[i].pendingRoleCount = 0;
+         continue;
+        }
+      if(g_levels[i].role == 0)
+        {
+         g_levels[i].role = side;
+         g_levels[i].pendingRoleCount = 0;
+         continue;
+        }
+      if(side == g_levels[i].role)
+        {
+         g_levels[i].pendingRoleCount = 0;
+         continue;
+        }
+      if(g_levels[i].pendingRole != side)
+        {
+         g_levels[i].pendingRole = side;
+         g_levels[i].pendingRoleCount = 0;
+        }
+      g_levels[i].pendingRoleCount++;
+      if(g_levels[i].pendingRoleCount >= confirm)
+         RegisterFlip(g_levels[i], side);
+     }
+  }
+
+// per tick: which side of the zone price last was on, touch episodes, re-arming
+void UpdateLevelTicks(const double bid)
+  {
+   double rearm = g_zone + RearmDistance();
+   for(int i = 0; i < ArraySize(g_levels); i++)
+     {
+      double d = bid - g_levels[i].price;
       if(d > g_zone)
-         g_levels[i].role = 1;
+        {
+         g_levels[i].lastSide = 1;
+         g_levels[i].inTouch = false;
+        }
       else if(d < -g_zone)
-         g_levels[i].role = -1;
+        {
+         g_levels[i].lastSide = -1;
+         g_levels[i].inTouch = false;
+        }
       if(g_levels[i].needReset && MathAbs(d) > rearm)
          g_levels[i].needReset = false;
      }
@@ -2172,24 +2756,44 @@ void CheckTouchSignals()
    if(InpOneSignalPerBar && g_signalsThisBar > 0)
       return;
    double bid = g_tick.bid;
-   double breakBuf = Pts(InpBreakoutBufferPoints);
+   double breakBuf = BreakBuffer();
+   double maxPen = (InpMaxPenetrationATR > 0.0 && g_atr > 0.0) ? InpMaxPenetrationATR * g_atr : 0.0;
+   double retreatNeeded = g_zone * MathMax(InpTouchRetreatPercent, 0) / 100.0;
    for(int i = 0; i < ArraySize(g_levels); i++)
      {
-      if(!LevelArmed(g_levels[i]))
-         continue;
       double lv = g_levels[i].price;
+      double d  = bid - lv;
       int dir = 0;
       string reason = "";
       if(InpDirectionMode == LT_DIR_BOUNCE)
         {
-         bool inZone = (bid <= lv + g_zone && bid >= lv - g_zone);
-         if(!inZone)
+         if(MathAbs(d) > g_zone)
+            continue;                                // outside the zone: no touch
+         if(g_levels[i].role == 0 || g_levels[i].lastSide != g_levels[i].role)
+            continue;                                // price must arrive from the role's side
+         if(!g_levels[i].inTouch)
+           {
+            g_levels[i].inTouch = true;
+            g_levels[i].touchExtreme = bid;
+           }
+         else if((g_levels[i].role > 0 && bid < g_levels[i].touchExtreme)
+                 || (g_levels[i].role < 0 && bid > g_levels[i].touchExtreme))
+            g_levels[i].touchExtreme = bid;
+         if(!LevelArmed(g_levels[i]))
             continue;
+         if(maxPen > 0.0 && ((g_levels[i].role > 0 && g_levels[i].touchExtreme < lv - maxPen)
+                             || (g_levels[i].role < 0 && g_levels[i].touchExtreme > lv + maxPen)))
+            continue;                                // pierced too deep: not a touch
+         double retreat = (g_levels[i].role > 0) ? bid - g_levels[i].touchExtreme : g_levels[i].touchExtreme - bid;
+         if(retreat < retreatNeeded)
+            continue;                                // wait for price to turn away from the level
          dir = (g_levels[i].role > 0) ? 1 : -1;
          reason = "touch";
         }
       else
         {
+         if(!LevelArmed(g_levels[i]))
+            continue;
          if(g_levels[i].role > 0 && bid < lv - breakBuf)
             dir = -1;
          else if(g_levels[i].role < 0 && bid > lv + breakBuf)
@@ -2198,7 +2802,7 @@ void CheckTouchSignals()
             continue;
          reason = "break";
         }
-      if(TryOpen(g_levels[i], dir, reason))
+      if(TryOpen(g_levels[i], dir, reason, 0, false))
         {
          if(InpOneSignalPerBar)
             return;
@@ -2208,6 +2812,7 @@ void CheckTouchSignals()
          // the touch happened but could not be traded: do not retry on every tick
          g_levels[i].needReset = true;
          g_levels[i].lastSignalTime = SignalBarTime(0);
+         g_stateDirty = true;
         }
      }
   }
@@ -2224,7 +2829,8 @@ void CheckBarSignals()
    if(o1 <= 0.0 || h1 <= 0.0 || l1 <= 0.0 || c1 <= 0.0)
       return;
    double range = h1 - l1;
-   double breakBuf = Pts(InpBreakoutBufferPoints);
+   double breakBuf = BreakBuffer();
+   double maxPen = (InpMaxPenetrationATR > 0.0 && g_atr > 0.0) ? InpMaxPenetrationATR * g_atr : 0.0;
    for(int i = 0; i < ArraySize(g_levels); i++)
      {
       if(!LevelArmed(g_levels[i]))
@@ -2234,13 +2840,13 @@ void CheckBarSignals()
       string reason = "";
       if(InpDirectionMode == LT_DIR_BOUNCE)
         {
-         if(g_levels[i].role > 0 && l1 <= lv + g_zone && c1 > lv)
+         if(g_levels[i].role > 0 && l1 <= lv + g_zone && c1 > lv && (maxPen <= 0.0 || l1 >= lv - maxPen))
            {
             double ratio = (range > 0.0) ? (c1 - l1) / range : 1.0;
             if(ratio >= InpMinRejectionRatio)
                dir = 1;
            }
-         else if(g_levels[i].role < 0 && h1 >= lv - g_zone && c1 < lv)
+         else if(g_levels[i].role < 0 && h1 >= lv - g_zone && c1 < lv && (maxPen <= 0.0 || h1 <= lv + maxPen))
            {
             double ratio = (range > 0.0) ? (h1 - c1) / range : 1.0;
             if(ratio >= InpMinRejectionRatio)
@@ -2258,7 +2864,7 @@ void CheckBarSignals()
         }
       if(dir == 0)
          continue;
-      if(TryOpen(g_levels[i], dir, reason))
+      if(TryOpen(g_levels[i], dir, reason, 1, true))
         {
          if(InpOneSignalPerBar)
             return;
@@ -2267,6 +2873,7 @@ void CheckBarSignals()
         {
          g_levels[i].needReset = true;
          g_levels[i].lastSignalTime = SignalBarTime(0);
+         g_stateDirty = true;
         }
      }
   }
@@ -2395,36 +3002,60 @@ bool PlacePending(SLevel &L, const int type)
   {
    string why = "";
    int dir = PendingDir(type);
-   if(!EntryAllowed(dir, L, why))
+   if(!EntryAllowed(dir, L, false, 0, why))
      {
-      LTLog(2, "pending on " + L.label + " not placed: " + why);
+      BlockSignal(L, why);
       return(false);
      }
+   if(InpPendingMaxDistanceATR > 0.0 && g_atr > 0.0
+      && MathAbs(L.price - g_tick.bid) > InpPendingMaxDistanceATR * g_atr)
+      return(false);                                 // too far away for now: try again later
    double price = PendingPrice(L, type);
    if(!PendingPriceValid(type, price))
       return(false);
    if(!EntrySpacingOK(dir, price))
       return(false);
    double sl = ComputeSL(dir, price, L.price);
-   if(InpMaxSLPoints > 0 && MathAbs(price - sl) > Pts(InpMaxSLPoints))
+   double slDist = MathAbs(price - sl);
+   if(InpMaxSLPoints > 0 && slDist > Pts(InpMaxSLPoints))
+     {
+      BlockSignal(L, "stop wider than max");
       return(false);
-   double tp = ComputeTP(dir, price, sl, L);
+     }
+   if(InpMaxSpreadPercentOfSL > 0.0 && slDist > 0.0
+      && SpreadPoints() * g_point > slDist * InpMaxSpreadPercentOfSL / 100.0)
+      return(false);
+   bool skip = false;
+   double tp = ComputeTP(dir, price, sl, L, skip, why);
+   if(skip)
+     {
+      BlockSignal(L, why);
+      L.pendingBar = SignalBarTime(0);
+      return(false);
+     }
    EnforceStopDistances(dir, price, sl, tp);
    double lots = ComputeLots(price, sl);
    if(lots <= 0.0)
       return(false);
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+     {
+      L.pendingBar = SignalBarTime(0);
+      Notify("SIGNAL ONLY: would place " + EnumToString((ENUM_ORDER_TYPE)type) + " " + DoubleToString(lots, 2)
+             + " @ " + PriceStr(price) + " level " + L.label + " SL " + PriceStr(sl) + " TP " + (tp > 0.0 ? PriceStr(tp) : "none"));
+      return(false);
+     }
    if(!MarginOK(dir, lots, price))
       return(false);
-   datetime exp = PendingExpiration();
-   ENUM_ORDER_TYPE_TIME tt = (exp > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
+   datetime expiry = PendingExpiration();
+   ENUM_ORDER_TYPE_TIME tt = (expiry > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
    string comment = LevelComment(L.key);
    bool sent = false;
    switch(type)
      {
-      case ORDER_TYPE_BUY_LIMIT:  sent = g_trade.BuyLimit(lots, price, _Symbol, sl, tp, tt, exp, comment);  break;
-      case ORDER_TYPE_SELL_LIMIT: sent = g_trade.SellLimit(lots, price, _Symbol, sl, tp, tt, exp, comment); break;
-      case ORDER_TYPE_BUY_STOP:   sent = g_trade.BuyStop(lots, price, _Symbol, sl, tp, tt, exp, comment);   break;
-      case ORDER_TYPE_SELL_STOP:  sent = g_trade.SellStop(lots, price, _Symbol, sl, tp, tt, exp, comment);  break;
+      case ORDER_TYPE_BUY_LIMIT:  sent = g_trade.BuyLimit(lots, price, _Symbol, sl, tp, tt, expiry, comment);  break;
+      case ORDER_TYPE_SELL_LIMIT: sent = g_trade.SellLimit(lots, price, _Symbol, sl, tp, tt, expiry, comment); break;
+      case ORDER_TYPE_BUY_STOP:   sent = g_trade.BuyStop(lots, price, _Symbol, sl, tp, tt, expiry, comment);   break;
+      case ORDER_TYPE_SELL_STOP:  sent = g_trade.SellStop(lots, price, _Symbol, sl, tp, tt, expiry, comment);  break;
      }
    uint rc = g_trade.ResultRetcode();
    if(!sent || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED))
@@ -2461,11 +3092,15 @@ void UpdatePending(SLevel &L)
    if(MathAbs(cur - mkt) <= freeze)
       return;                                        // inside the freeze zone: cannot modify
    double sl = ComputeSL(dir, price, L.price);
-   double tp = ComputeTP(dir, price, sl, L);
+   bool skip = false;
+   string why = "";
+   double tp = ComputeTP(dir, price, sl, L, skip, why);
+   if(skip)
+      tp = OrderGetDouble(ORDER_TP);                  // keep the old target rather than cancelling here
    EnforceStopDistances(dir, price, sl, tp);
    ENUM_ORDER_TYPE_TIME tt = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
-   datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
-   if(!g_trade.OrderModify(L.pendingTicket, price, sl, tp, tt, exp))
+   datetime expiry = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+   if(!g_trade.OrderModify(L.pendingTicket, price, sl, tp, tt, expiry))
       LTLog(2, "modify order #" + IntegerToString((long)L.pendingTicket) + " failed: " + g_trade.ResultRetcodeDescription());
    else
       LTLog(2, "order #" + IntegerToString((long)L.pendingTicket) + " moved to " + PriceStr(price));
@@ -2484,6 +3119,7 @@ void OnPendingGone(SLevel &L)
       L.needReset = true;
       g_signalsThisBar++;
       g_dayTrades++;
+      g_stateDirty = true;
       Notify("order #" + IntegerToString((long)L.pendingTicket) + " on " + L.label + " filled");
      }
    L.pendingTicket = 0;
@@ -2554,7 +3190,9 @@ void MaintainPendingOrders(const bool newBar)
       if(hasOrder)
         {
          int type = (int)OrderGetInteger(ORDER_TYPE);
+         string conflict = "";
          bool wrong = (desired < 0) || (type != desired) || capReached
+                      || OppositeConflict(PendingDir(type), buys, sells, false, conflict)
                       || (InpMaxPositionsPerLevel > 0 && CountLevelPositions(g_levels[i].key) >= InpMaxPositionsPerLevel);
          if(wrong)
            {
@@ -2626,17 +3264,34 @@ string SourceName(const int source)
 
 string LevelStateName(const SLevel &L)
   {
+   if(L.targetOnly)
+      return("target only");
    if(L.role == 0)
       return("wait side");
    if(InpMaxTradesPerLevel > 0 && L.trades >= InpMaxTradesPerLevel)
       return("done");
+   if(InpMaxLossesPerLevelDay > 0 && LevelLossesToday(L.key) >= InpMaxLossesPerLevelDay)
+      return("lost today");
+   if(InpChopMaxFlips > 0 && L.flipCount >= InpChopMaxFlips && BarsSince(L.lastFlipTime) < InpChopWindowBars)
+      return("chop");
    if(L.needReset)
       return("used");
    if(InpCooldownBars > 0 && BarsSince(L.lastSignalTime) < InpCooldownBars)
       return("cooldown");
    if(L.pendingTicket != 0)
       return("order #" + IntegerToString((long)L.pendingTicket));
+   if(L.inTouch)
+      return("touching");
    return("ARMED");
+  }
+
+string GradeName(const int grade)
+  {
+   if(grade <= LT_GRADE_A)
+      return("A");
+   if(grade == LT_GRADE_B)
+      return("B");
+   return("C");
   }
 
 void UpdateDashboard()
@@ -2654,10 +3309,13 @@ void UpdateDashboard()
    string s = LT_NAME;
    s += "  " + _Symbol + " " + TFToString(_Period) + "   signals: " + TFToString(g_sigTF) + "\n";
    s += "Mode: " + EntryModeName() + " / " + (InpDirectionMode == LT_DIR_BOUNCE ? "Bounce" : "Breakout")
+        + (InpTradeMode == LT_MODE_SIGNAL_ONLY ? "   *** SIGNAL ONLY ***" : "")
         + "   zone: " + DoubleToString(g_zone / g_point, 0) + " pts   spread: " + IntegerToString(SpreadPoints())
         + "   ATR: " + (g_atr > 0.0 ? DoubleToString(g_atr / g_point, 0) : "-") + " pts\n";
    s += "Trading: " + (allowed ? "allowed" : ("BLOCKED - " + why))
-        + (g_dayStopped ? "   DAILY LOSS STOP" : "") + "\n";
+        + (g_dayStopped ? "   STOPPED FOR THE DAY" : "") + "\n";
+   if(g_lastBlock != "")
+      s += "Last skipped signal: " + g_lastBlock + "\n";
    s += "Positions: " + IntegerToString(buys + sells) + " (B " + IntegerToString(buys) + " / S " + IntegerToString(sells)
         + ")   pending: " + IntegerToString(CountPendingOrders())
         + "   today: " + IntegerToString(g_dayTrades) + " trades, P/L "
@@ -2697,8 +3355,9 @@ void UpdateDashboard()
       string lbl = g_levels[i].label;
       if(StringLen(lbl) > 24)
          lbl = StringSubstr(lbl, 0, 24);
-      s += "  " + PriceStr(g_levels[i].price) + "  " + roleTxt + "  " + (d >= 0 ? "+" : "") + DoubleToString(d, 0)
-           + " pts  " + LevelStateName(g_levels[i]) + "  [" + SourceName(g_levels[i].source) + "] " + lbl + "\n";
+      s += "  " + PriceStr(g_levels[i].price) + "  " + roleTxt + " " + GradeName(g_levels[i].grade) + "  "
+           + (d >= 0 ? "+" : "") + DoubleToString(d, 0) + " pts  " + LevelStateName(g_levels[i])
+           + "  [" + SourceName(g_levels[i].source) + "] " + lbl + "\n";
      }
    Comment(s);
   }
@@ -2762,6 +3421,36 @@ bool ValidateInputs()
    if(InpATRPeriod <= 0)
      {
       LTLog(0, "InpATRPeriod must be > 0");
+      ok = false;
+     }
+   if(InpTouchRetreatPercent < 0 || InpTouchRetreatPercent > 90)
+     {
+      LTLog(0, "InpTouchRetreatPercent must be between 0 and 90");
+      ok = false;
+     }
+   if(InpRoleConfirmBars <= 0 || InpChopWindowBars <= 0)
+     {
+      LTLog(0, "InpRoleConfirmBars and InpChopWindowBars must be > 0");
+      ok = false;
+     }
+   if(InpMergeDistancePoints > InpTouchZonePoints)
+     {
+      LTLog(0, "InpMergeDistancePoints should not exceed InpTouchZonePoints");
+      ok = false;
+     }
+   if(InpRolloverSkipMinutes < 0 || InpRolloverSkipMinutes > 180)
+     {
+      LTLog(0, "InpRolloverSkipMinutes must be between 0 and 180");
+      ok = false;
+     }
+   if(InpUseADXFilter && InpADXPeriod <= 0)
+     {
+      LTLog(0, "InpADXPeriod must be > 0");
+      ok = false;
+     }
+   if(InpMagic == 0)
+     {
+      LTLog(0, "InpMagic must not be 0");
       ok = false;
      }
    if(InpUseTimeFilter && (InpStartHour < 0 || InpStartHour > 23 || InpEndHour < 0 || InpEndHour > 24))
@@ -2845,6 +3534,16 @@ int OnInit()
          return(INIT_FAILED);
         }
      }
+   if(InpUseADXFilter)
+     {
+      ENUM_TIMEFRAMES adxTF = (InpADXTF == PERIOD_CURRENT) ? g_sigTF : InpADXTF;
+      g_adxHandle = iADX(_Symbol, adxTF, InpADXPeriod);
+      if(g_adxHandle == INVALID_HANDLE)
+        {
+         LTLog(0, "ADX handle failed (" + IntegerToString(GetLastError()) + ")");
+         return(INIT_FAILED);
+        }
+     }
    if(InpVAL_Enable)
      {
       g_valHandle = iCustom(_Symbol, g_sigTF, InpVAL_IndicatorName,
@@ -2890,13 +3589,19 @@ int OnInit()
 
    ArrayResize(g_levels, 0);
    ArrayResize(g_links, 0);
+   ArrayResize(g_losses, 0);
    g_lastBarTime = 0;
    g_objDirty = true;
    g_lastEngineRun = 0;
    g_dayStart = 0;
+   g_lastBlock = "";
+   g_signalSeq = 0;
+   LoadState();
    string why = "";
    if(!TradingAllowed(why))
       LTLog(0, "warning: " + why);
+   if(InpTradeMode == LT_MODE_SIGNAL_ONLY)
+      LTLog(0, "SIGNAL ONLY mode: no orders will be sent");
    LTLog(1, "initialised: " + EntryModeName() + " / " + (InpDirectionMode == LT_DIR_BOUNCE ? "Bounce" : "Breakout")
          + ", signals on " + TFToString(g_sigTF) + ", " + (g_hedging ? "hedging" : "netting") + " account");
    return(INIT_SUCCEEDED);
@@ -2908,14 +3613,19 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   if(ArraySize(g_levels) > 0 || ArraySize(g_saved) > 0)
+      SaveState();
    if(g_atrHandle != INVALID_HANDLE)
       IndicatorRelease(g_atrHandle);
    if(g_maHandle != INVALID_HANDLE)
       IndicatorRelease(g_maHandle);
+   if(g_adxHandle != INVALID_HANDLE)
+      IndicatorRelease(g_adxHandle);
    if(g_valHandle != INVALID_HANDLE)
       IndicatorRelease(g_valHandle);
    g_atrHandle = INVALID_HANDLE;
    g_maHandle  = INVALID_HANDLE;
+   g_adxHandle = INVALID_HANDLE;
    g_valHandle = INVALID_HANDLE;
    Comment("");
    if(InpDeleteObjectsOnExit)
@@ -2978,24 +3688,22 @@ void OnTick()
    PruneLinks();
    ManagePositions();
 
-   //--- signals: roles are updated AFTER the checks so a check sees the side price came from
-   if(InpEntryMode == LT_ENTRY_TOUCH)
+   //--- bar logic: the close-confirmed check runs BEFORE roles are updated with that close,
+   //    so it sees the side price came from
+   if(newBar)
      {
-      CheckTouchSignals();
-      UpdateLevelStates(g_tick.bid);
-     }
-   else if(InpEntryMode == LT_ENTRY_CONFIRM_CLOSE)
-     {
-      if(newBar && !firstRun)
+      if(!firstRun && InpEntryMode == LT_ENTRY_CONFIRM_CLOSE)
          CheckBarSignals();
-      if(newBar)
-         UpdateLevelStates(iClose(_Symbol, g_sigTF, 1));
+      UpdateLevelRoles(iClose(_Symbol, g_sigTF, 1));
+      if(g_stateDirty)
+         SaveState();
      }
-   else
-     {
-      UpdateLevelStates(g_tick.bid);
+   //--- tick logic
+   if(InpEntryMode == LT_ENTRY_TOUCH)
+      CheckTouchSignals();
+   UpdateLevelTicks(g_tick.bid);
+   if(InpEntryMode == LT_ENTRY_PENDING)
       MaintainPendingOrders(newBar);
-     }
    UpdateDashboard();
   }
 
