@@ -14,6 +14,9 @@ tools/gen_presets.py                                 regenerates the presets fro
 tools/mqlcheck/                                      g++-based syntax check used while developing
 ```
 
+The repository also holds [`scanner/`](scanner/README.md), a Python scanner that looks for
+swing setups across the 28 forex pairs and gold on the daily chart.
+
 ## Install
 
 1. Copy `MQL5/Experts/LineTouchEA.mq5` into `<terminal data folder>\MQL5\Experts\`.
