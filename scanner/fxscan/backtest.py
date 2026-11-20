@@ -2,7 +2,8 @@
 
 Rules of the replay (kept deliberately conservative):
 * a signal on bar t is entered at the open of bar t+1; stop and target stay where the
-  signal put them, and the trade is skipped if the open is already beyond either;
+  signal put them, and the trade is skipped if the open is more than half the risk
+  distance away from the signal bar's close;
 * if a bar's range contains both the stop and the target, the stop is taken;
 * a gap through the stop exits at the open (worse than the stop);
 * trades still open after `max_bars` bars are closed at that bar's close;
@@ -18,6 +19,8 @@ import numpy as np
 import pandas as pd
 
 from .setups import PairData, WARMUP, detect
+
+MAX_ENTRY_GAP = 0.5   # skip a signal when the next open is further than this many R from its close
 
 
 @dataclass
@@ -52,7 +55,11 @@ def backtest_pair(p: PairData, start: int = WARMUP, max_bars: int = 20) -> list[
         e = t + 1
         entry = p.o[e]
         risk = (entry - stop) * d
-        if risk <= 0 or (target - entry) * d <= 0:
+        signal_risk = (p.c[t] - stop) * d
+        # An open far from the signal close changes the trade (and in daily FX data is often
+        # a bad print): such signals are skipped, as a trader looking at the gap would.
+        if (risk <= 0 or (target - entry) * d <= 0
+                or abs(entry - p.c[t]) > MAX_ENTRY_GAP * signal_risk):
             t += 1
             continue
         exit_price = outcome = None

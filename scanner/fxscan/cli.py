@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import backtest as bt
 from . import report
-from .data import CsvProvider, OandaProvider
+from .data import CsvProvider, OandaProvider, TwelveDataProvider
 from .scan import load_universe, scan
 from .universe import ALL_SYMBOLS
 
@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 def _provider(args):
     if args.csv_dir:
         return CsvProvider(args.csv_dir)
+    if args.provider == "twelvedata":
+        return TwelveDataProvider(cache_dir=ROOT / ".cache", cache_minutes=args.cache_minutes)
     return OandaProvider(account=args.oanda_account, cache_dir=ROOT / ".cache",
                          cache_minutes=args.cache_minutes)
 
@@ -30,7 +32,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="fxscan", description=__doc__)
     ap.add_argument("command", choices=["scan", "backtest"])
     ap.add_argument("--symbols", help="comma-separated list (default: 28 FX pairs + XAUUSD)")
-    ap.add_argument("--csv-dir", help="read <SYMBOL>_D1.csv / _H4.csv from this folder instead of OANDA")
+    ap.add_argument("--csv-dir", help="read <SYMBOL>_D1.csv / _H4.csv from this folder instead of going online")
+    ap.add_argument("--provider", choices=["twelvedata", "oanda"], default="twelvedata",
+                    help="online price source (default: twelvedata)")
     ap.add_argument("--oanda-account", choices=["practice", "live"], default="practice",
                     help="which OANDA API host the token belongs to (data only; no orders are sent)")
     ap.add_argument("--out", default=str(ROOT / "out"), help="output folder (default: scanner/out)")

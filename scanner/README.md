@@ -7,7 +7,7 @@ orders.
 
 ```
 fxscan/universe.py    the 29 instruments, pip sizes, assumed spreads
-fxscan/data.py        price providers: OANDA v20 API, or CSV files (e.g. MetaTrader exports)
+fxscan/data.py        price providers: Twelve Data, OANDA, or CSV files (e.g. MetaTrader exports)
 fxscan/indicators.py  EMA, ATR, RSI, ADX
 fxscan/zigzag.py      ZigZag pivots (same Depth/Deviation/Backstep algorithm as LineTouchEA)
 fxscan/levels.py      monthly / weekly / daily support and resistance from those pivots
@@ -29,15 +29,21 @@ python -m fxscan scan              # today's setups, writes out/scan.md and out/
 python -m pytest -q tests
 ```
 
-Prices come from one of two sources:
+Prices come from one of three sources:
 
-* **OANDA** (default). Create a free practice account, generate a personal access token
-  under *Manage API Access*, and expose it as `OANDA_API_TOKEN`. Use
-  `--oanda-account live` if the token belongs to a live account. Only the candles
-  endpoint is called.
+* **Twelve Data** (default). Needs an API key in `TWELVEDATA_API_KEY`; the free plan is
+  enough. Downloads are paced to its 8 requests a minute, so a first full run takes about
+  four minutes; responses are cached in `.cache/` (`--cache-minutes`).
+* **OANDA**: `--provider oanda` with a practice-account personal access token in
+  `OANDA_API_TOKEN` (`--oanda-account live` for a live-account token). Only the candles
+  endpoint is called. This provider has been tested against recorded responses only.
 * **CSV files**: `--csv-dir <folder>` with one `<SYMBOL>_D1.csv` per instrument (and
   optionally `<SYMBOL>_H4.csv`), columns `time,open,high,low,close`. This lets the scan
   run on your own broker's bars exported from MetaTrader.
+
+Data vendors build daily bars differently (session cut-off, which quotes count as the
+high and low), so wicks and opens can differ from your broker's chart. Check a setup on
+your own chart before acting on it.
 
 Other options: `--symbols EURUSD,GBPJPY`, `--years 10`, `--no-h4`, `--out <folder>`, `-v`.
 
@@ -73,7 +79,8 @@ bars, each setup gets a timing note on whether the H4 chart has turned.
 
 ## How the backtest replays trades
 
-* A signal on bar *t* is entered at the open of bar *t+1*.
+* A signal on bar *t* is entered at the open of bar *t+1*; it is skipped when that open
+  is more than half the risk distance from the signal bar's close.
 * If one bar contains both stop and target, the stop is taken. A gap through the stop
   exits at the open.
 * Trades still open after 20 bars close at that bar's close.

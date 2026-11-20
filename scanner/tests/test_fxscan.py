@@ -4,7 +4,7 @@ import pytest
 
 from fxscan import indicators as ind
 from fxscan.backtest import backtest_pair, summarize
-from fxscan.data import CsvProvider, OandaProvider, DataError, clean, drop_unfinished, DAILY_CLOSE
+from fxscan.data import CsvProvider, OandaProvider, TwelveDataProvider, DataError, clean, drop_unfinished, DAILY_CLOSE
 from fxscan.levels import aggregate, build_levels
 from fxscan.setups import PairData, WARMUP, detect, daily_trend
 from fxscan.strength import strength_panel
@@ -160,6 +160,25 @@ def test_oanda_provider_reports_auth_failure():
     with pytest.raises(DataError, match="401"):
         OandaProvider(token="bad", session=ses).daily("EURUSD")
     assert len(ses.calls) == 1      # no pointless retries
+
+
+def test_twelvedata_provider_parses_and_drops_forming_bar():
+    today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+    days = pd.bdate_range(end=today + pd.Timedelta(days=3), periods=6)   # last ones are in the future
+    values = [{"datetime": str(d.date()), "open": "1.1", "high": "1.2", "low": "1.0", "close": "1.15"}
+              for d in days]
+    ses = FakeSession(FakeResponse(200, {"status": "ok", "values": values}))
+    df = TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None).daily("EURUSD")
+    assert 1 <= len(df) < 6 and df.index[-1] <= today
+    url, kw = ses.calls[0]
+    assert kw["params"]["symbol"] == "EUR/USD" and kw["headers"]["Authorization"] == "apikey k"
+
+
+def test_twelvedata_provider_error_in_body():
+    ses = FakeSession(FakeResponse(200, {"status": "error", "code": 401, "message": "bad key"}))
+    with pytest.raises(DataError, match="401"):
+        TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None).daily("EURUSD")
+    assert len(ses.calls) == 1
 
 
 def test_csv_provider_roundtrip(tmp_path):
