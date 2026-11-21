@@ -162,16 +162,38 @@ def test_oanda_provider_reports_auth_failure():
     assert len(ses.calls) == 1      # no pointless retries
 
 
-def test_twelvedata_provider_parses_and_drops_forming_bar():
-    today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
-    days = pd.bdate_range(end=today + pd.Timedelta(days=3), periods=6)   # last ones are in the future
-    values = [{"datetime": str(d.date()), "open": "1.1", "high": "1.2", "low": "1.0", "close": "1.15"}
-              for d in days]
-    ses = FakeSession(FakeResponse(200, {"status": "ok", "values": values}))
-    df = TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None).daily("EURUSD")
-    assert 1 <= len(df) < 6 and df.index[-1] <= today
+def _td_values(last="2026-11-20"):
+    return [{"datetime": str(d.date()), "open": "1.1", "high": "1.2", "low": "1.0", "close": "1.15"}
+            for d in pd.bdate_range(end=last, periods=5)]
+
+
+@pytest.mark.parametrize("fetched, last_bar", [
+    ("2026-11-20 18:00", "2026-11-19"),    # Friday still trading: its bar is dropped
+    ("2026-11-20 22:30", "2026-11-20"),    # after the close: kept
+])
+def test_twelvedata_provider_drops_bar_forming_at_download(fetched, last_bar):
+    ses = FakeSession(FakeResponse(200, {"status": "ok", "values": _td_values()}))
+    clock = lambda: pd.Timestamp(fetched).timestamp()
+    df = TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None, clock=clock).daily("EURUSD")
+    assert str(df.index[-1].date()) == last_bar
     url, kw = ses.calls[0]
     assert kw["params"]["symbol"] == "EUR/USD" and kw["headers"]["Authorization"] == "apikey k"
+
+
+def test_twelvedata_cache_does_not_promote_a_forming_bar(tmp_path):
+    """A response cached mid-session must not have its last bar treated as closed later."""
+    import os
+    ses = FakeSession(FakeResponse(200, {"status": "ok", "values": _td_values()}))
+    mid_session = pd.Timestamp("2026-11-20 18:00").timestamp()
+    first = TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None, cache_dir=tmp_path,
+                               clock=lambda: mid_session)
+    first.daily("EURUSD")
+    for f in tmp_path.iterdir():                 # the cache file was written mid-session
+        os.utime(f, (mid_session, mid_session))
+    later = TwelveDataProvider(api_key="k", session=ses, sleep=lambda s: None, cache_dir=tmp_path,
+                               cache_minutes=1e9)
+    df = later.daily("EURUSD")
+    assert len(ses.calls) == 1 and str(df.index[-1].date()) == "2026-11-19"
 
 
 def test_twelvedata_provider_error_in_body():

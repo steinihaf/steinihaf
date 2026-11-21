@@ -138,13 +138,15 @@ class TwelveDataProvider:
 
     def __init__(self, api_key: str | None = None, cache_dir: str | os.PathLike | None = None,
                  cache_minutes: float = 30, requests_per_minute: float = 8, session=None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, clock=time.time):
         self.key = api_key or os.environ.get("TWELVEDATA_API_KEY") or "set-by-proxy"
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.cache_seconds = cache_minutes * 60
         self.gap = 60.0 / requests_per_minute + 0.3
         self._session = session
         self._sleep = sleep
+        self._clock = clock
+        self._fetched: dict[tuple, float] = {}   # when each response was downloaded
         self._last_call = 0.0
 
     def _get(self, symbol: str, interval: str, size: int) -> dict:
@@ -153,6 +155,7 @@ class TwelveDataProvider:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache = self.cache_dir / f"td_{symbol}_{interval}_{size}.json"
             if cache.exists() and time.time() - cache.stat().st_mtime < self.cache_seconds:
+                self._fetched[(symbol, interval)] = cache.stat().st_mtime
                 return json.loads(cache.read_text())
         if self._session is None:
             import requests
@@ -172,6 +175,7 @@ class TwelveDataProvider:
                 # Twelve Data reports most errors in the body, with HTTP 200
                 code = payload.get("code", r.status_code) if payload.get("status") != "ok" else 200
                 if code == 200:
+                    self._fetched[(symbol, interval)] = self._clock()
                     if cache:
                         cache.write_text(json.dumps(payload))
                     return payload
@@ -186,21 +190,25 @@ class TwelveDataProvider:
             self._sleep(2 ** attempt)
         raise DataError(f"{symbol} {interval}: download failed ({last_error})")
 
-    def _frame(self, symbol: str, interval: str, size: int) -> pd.DataFrame:
+    def _frame(self, symbol: str, interval: str, size: int, closes_after: pd.Timedelta) -> pd.DataFrame:
         values = self._get(symbol, interval, size).get("values") or []
         if not values:
             raise DataError(f"{symbol}: no {interval} bars returned")
         idx = pd.to_datetime([v["datetime"] for v in values])
         rows = [[float(v[k]) for k in COLUMNS] for v in values]
-        return clean(pd.DataFrame(rows, index=idx, columns=COLUMNS))
+        df = clean(pd.DataFrame(rows, index=idx, columns=COLUMNS))
+        if interval == "1day":
+            df = df[df.index.weekday < 5]
+        # The last bar counts only if it had closed when the response was downloaded - a
+        # cached response can hold a bar that was still forming at the time.
+        fetched = pd.Timestamp(self._fetched[(symbol, interval)], unit="s")
+        return drop_unfinished(df, closes_after, now=fetched)
 
     def daily(self, symbol: str, years: int = 10) -> pd.DataFrame:
-        df = self._frame(symbol, "1day", min(5000, years * 262))
-        df = df[df.index.weekday < 5]
-        return drop_unfinished(df, DAILY_CLOSE)
+        return self._frame(symbol, "1day", min(5000, years * 262), DAILY_CLOSE)
 
     def h4(self, symbol: str, days: int = 120) -> pd.DataFrame:
-        return drop_unfinished(self._frame(symbol, "4h", min(5000, days * 6)), pd.Timedelta(hours=4))
+        return self._frame(symbol, "4h", min(5000, days * 6), pd.Timedelta(hours=4))
 
 
 class CsvProvider:
