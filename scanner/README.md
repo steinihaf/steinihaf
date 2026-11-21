@@ -1,5 +1,10 @@
 # fxscan — forex swing-trade scanner
 
+> **Status:** the setups below were tested over ten years and did not beat costs, and a
+> follow-up study of six other rule families found no dependable edge either
+> (see [`research/FINDINGS.md`](research/FINDINGS.md)). Use the scanner as a watchlist and
+> context tool, not as a signal service.
+
 Scans the 28 major and cross pairs plus gold on the daily chart, lists the instruments
 that completed a swing setup on the last closed bar, and replays the same rules over
 history so the setups can be judged on evidence. It reads prices only: it never sends
@@ -16,6 +21,7 @@ fxscan/setups.py      the two setups and the 0-100 confluence score
 fxscan/scan.py        scan of the last completed bar + watchlist
 fxscan/backtest.py    bar-by-bar replay of the same rules
 tests/                pytest suite (runs offline)
+research/             the rule study: scripts and FINDINGS.md
 ```
 
 ## Run it

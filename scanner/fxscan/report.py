@@ -40,6 +40,15 @@ def scan_markdown(payload: dict) -> str:
          f"Generated {payload['generated_utc']} UTC. {payload['instruments_scanned']} instruments scanned, "
          f"{len(payload['setups'])} setups, {len(payload['watchlist'])} on watch.", "",
          f"_{DISCLAIMER}_", ""]
+    bt = payload.get("backtest") or {}
+    kinds = bt.get("by_kind") or {}
+    if kinds:
+        parts = [f"{k} {v['avg_r']:+.3f}R over {v['trades']} trades"
+                 for k, v in kinds.items() if v.get("trades")]
+        L += ["**Evidence:** replayed over history, these setups have not beaten costs "
+              f"(average result per trade: {'; '.join(parts)}). Treat this list as a watchlist "
+              "of pairs at interesting places, not as trade signals. The score counts "
+              "confluence; in testing a higher score did not mean a better outcome.", ""]
     L += ["## Setups", ""]
     if not payload["setups"]:
         L += ["No instrument completed a setup on this bar.", ""]
