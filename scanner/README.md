@@ -22,6 +22,7 @@ fxscan/scan.py        scan of the last completed bar + watchlist
 fxscan/backtest.py    bar-by-bar replay of the same rules
 tests/                pytest suite (runs offline)
 research/             the rule study: scripts and FINDINGS.md
+fxbot/                demo-account autopilot built on the scanner (see fxbot/README.md)
 ```
 
 ## Run it
