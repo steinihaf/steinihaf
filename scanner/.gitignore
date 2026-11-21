@@ -1,0 +1,6 @@
+out/
+.cache/
+__pycache__/
+.pytest_cache/
+bot_state/
+fxbot.toml
