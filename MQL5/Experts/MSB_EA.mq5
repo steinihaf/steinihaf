@@ -27,7 +27,7 @@
 //| NEW AND UNTESTED: Strategy Tester and demo first.                |
 //+------------------------------------------------------------------+
 #property copyright "Stein"
-#property version   "1.10"
+#property version   "1.11"
 
 #include <Trade\Trade.mqh>
 
@@ -97,11 +97,11 @@ input ulong  InpMagic            = 20261120;             // Magic number: Asia +
 
 input group "=== Wick-break entry (all sessions; candles of each session's signal timeframe) ==="
 input bool   InpWB_UseA          = false;                // Module A on/off: enter DURING the next candle, when price passes the break candle's wick by A%
-input double InpWB_PctA          = 15;                   // Module A: % of the break candle's body that price must pass its wick by
+input double InpWB_PctA          = 0;                    // Module A: extra % of the break candle's body beyond its wick (0 = enter the instant the wick is passed)
 input bool   InpWB_UseB          = false;                // Module B on/off: enter when the next candle CLOSES past the break candle's wick by B%
 input double InpWB_PctB          = 15;                   // Module B: % of the break candle's body that the close must pass its wick by
-input double InpWB_SLBufferPips  = 5;                    // Wick-break: stop this many pips beyond the confirming candle's wick
-input double InpWB_MinSLPips     = 50;                   // Wick-break: smallest stop distance allowed (pips); a closer wick is widened to this
+input double InpWB_SLBufferPips  = 0;                    // Wick-break: stop this many pips beyond the confirming candle's wick (0 = exactly on the wick)
+input double InpWB_MinSLPips     = 0;                    // Wick-break: smallest stop distance allowed (pips); 0 = no minimum of your own
 input bool   InpWB_KeepNormalEntry = false;              // Wick-break: false = replaces the normal breakout entry while A or B is on, true = both run
 
 input group "=============== ASIA SESSION ==============="
@@ -3077,8 +3077,10 @@ void ASB_EA_PlaceEntry(const int k, const ASBEvent &ev)
 //|             reaches the trigger. One attempt per candle.          |
 //|   Module B: when that next candle closes, enter if its CLOSE is   |
 //|             at or beyond the trigger.                             |
-//| Stop: beyond the confirming candle's opposite wick (for module A  |
-//| that is the wick as it stands at the moment of entry).            |
+//| Stop: exactly on the confirming candle's opposite wick (for       |
+//| module A, the wick as it stands at the moment of entry). It       |
+//| replaces the session's stop-loss pips, and is moved out only when |
+//| the wick is closer than the spread / broker stop level allows.    |
 //| Take profit, break-even and trailing: the session's own settings. |
 //| Every filter of the session (quality, OBV, Value Area, USDX,      |
 //| spread) applies, and a direction is still traded once per cycle.  |
@@ -3125,18 +3127,20 @@ bool ASB_EA_WickBreakEnter(const int k, const int dir, const double anchor, cons
    if(!ASB_EA_FiltersOK(k, ev, qstat, why))
       return false;
 
-   // Stop beyond the confirming candle's wick. Candle highs are bid prices but a
-   // sell is stopped out on the ask, so a sell's stop also clears the spread.
+   // Stop exactly on the confirming candle's wick (plus the optional buffer). This
+   // replaces the session's own stop-loss pips for wick-break trades.
    double sl = anchor - dir * InpWB_SLBufferPips * g_pip;
-   if(dir < 0)
-      sl += (ask - bid);
-   double sl_dist  = (price - sl) * dir;
-   double min_dist = InpWB_MinSLPips * g_pip;
-   if(sl_dist < min_dist)
+   double sl_dist = (price - sl) * dir;
+   // The closest stop that can exist at all: it must clear the spread (or it would
+   // be hit the instant the trade opens) and the broker's own minimum stop distance.
+   long   stop_pts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double floor_dist = (ask - bid) + (double)MathMax(stop_pts, 0) * _Point + _Point;
+   floor_dist = MathMax(floor_dist, InpWB_MinSLPips * g_pip);
+   if(sl_dist < floor_dist)
      {
-      PrintFormat("MSB EA: %s - the wick is only %.1f pips away, stop widened to the %.1f pip minimum.",
-                  dirtxt, MathMax(sl_dist, 0.0) / g_pip, InpWB_MinSLPips);
-      sl_dist = min_dist;
+      PrintFormat("MSB EA: %s - the wick is only %.1f pips from the entry; stop moved out to %.1f pips, the closest allowed (spread, broker stop level, your minimum).",
+                  dirtxt, MathMax(sl_dist, 0.0) / g_pip, floor_dist / g_pip);
+      sl_dist = floor_dist;
       sl = price - dir * sl_dist;
      }
    double tp_dist = g_s[k].tp_pips * g_pip;
