@@ -16,11 +16,18 @@
 //| / London / New York / Sydney), so the sessions never mix up      |
 //| their ranges or trades.                                          |
 //|                                                                  |
+//| WICK-BREAK ENTRY (optional, off by default): a candle's wick     |
+//| breaks a session level (the break candle); the NEXT candle must   |
+//| push past that wick by a set % of the break candle's body.        |
+//| Module A enters during that candle, the moment price gets there;  |
+//| Module B waits for it to CLOSE there. The stop goes beyond the    |
+//| confirming candle's own wick. See "Wick-break entry" inputs.      |
+//|                                                                  |
 //| ONE FILE: needs no include folder and no indicator files.        |
 //| NEW AND UNTESTED: Strategy Tester and demo first.                |
 //+------------------------------------------------------------------+
 #property copyright "Stein"
-#property version   "1.00"
+#property version   "1.10"
 
 #include <Trade\Trade.mqh>
 
@@ -87,6 +94,15 @@ input int    InpPipPoints        = 10;                   // Points per pip (10 =
 input bool   InpUseMinLot        = true;                 // Risk too small for the smallest lot: true = trade the smallest lot, false = skip
 input int    InpSlippagePoints   = 20;                   // Max slippage for market orders (points)
 input ulong  InpMagic            = 20261120;             // Magic number: Asia +0, London +1, New York +2, Sydney +3
+
+input group "=== Wick-break entry (all sessions; candles of each session's signal timeframe) ==="
+input bool   InpWB_UseA          = false;                // Module A on/off: enter DURING the next candle, when price passes the break candle's wick by A%
+input double InpWB_PctA          = 15;                   // Module A: % of the break candle's body that price must pass its wick by
+input bool   InpWB_UseB          = false;                // Module B on/off: enter when the next candle CLOSES past the break candle's wick by B%
+input double InpWB_PctB          = 15;                   // Module B: % of the break candle's body that the close must pass its wick by
+input double InpWB_SLBufferPips  = 5;                    // Wick-break: stop this many pips beyond the confirming candle's wick
+input double InpWB_MinSLPips     = 50;                   // Wick-break: smallest stop distance allowed (pips); a closer wick is widened to this
+input bool   InpWB_KeepNormalEntry = false;              // Wick-break: false = replaces the normal breakout entry while A or B is on, true = both run
 
 input group "=============== ASIA SESSION ==============="
 input bool                InpAS_Use              = true;           // Asia: trade this session's breakout
@@ -1013,6 +1029,18 @@ struct MSBSession
    double           va_cache_vah;    // (previous-period levels stay the same for a whole period,
    double           va_cache_poc;    //  so they are worked out once and remembered)
    double           va_cache_val;
+   // --- wick-break module A: what it is waiting for during the candle forming now ---
+   datetime         wb_bar;          // open time of the candle the triggers below belong to (0 = not armed)
+   double           wb_trig_up;      // buy when the bid reaches this (0 = no buy armed)
+   double           wb_trig_dn;      // sell when the bid reaches this (0 = no sell armed)
+   int              wb_q_up;         // quality status worked out for each direction when it was armed
+   int              wb_q_dn;
+   string           wb_why_up;
+   string           wb_why_dn;
+   double           wb_range_hi;     // the session range and window the armed setup belongs to
+   double           wb_range_lo;
+   datetime         wb_day_end;
+   int              wb_day_idx;
    datetime         usdx_cache_bar;  // last closed bar the two EMAs below were worked out for
    double           usdx_cache_ef;
    double           usdx_cache_es;
@@ -2224,6 +2252,7 @@ void OnTick()
    ASB_EA_CheckDayEnd();     // every tick
    ASB_EA_ManageM1();        // once per closed M1 bar
    ASB_EA_CheckSignalBar();  // once per closed SignalTF bar
+   ASB_EA_WickBreakTick();   // every tick, only while wick-break module A is armed
   }
 
 //+------------------------------------------------------------------+
@@ -2608,6 +2637,13 @@ void ASB_EA_ProcessSession(const int k, const MqlRates &sig[], const int got, co
         }
      }
 
+   // Wick-break entry (modules A and B), when switched on.
+   bool wb_on = (InpWB_UseA || InpWB_UseB);
+   if(wb_on)
+      ASB_EA_WickBreakOnBar(k, sig, got, days, events, today, day_status, ma_ok, ma_val);
+   if(wb_on && !InpWB_KeepNormalEntry)
+      return;                                       // wick-break replaces the normal breakout entry
+
    datetime now = TimeCurrent();
    for(int i = 0; i < ArraySize(events); i++)
      {
@@ -2661,12 +2697,12 @@ void ASB_EA_OnNewSignalBar(const int k)
   }
 
 //+------------------------------------------------------------------+
-//| Evaluate every enabled filter for one event and, if everything     |
-//| passes, place the entry. Skips (no trade this bar, may retry the  |
-//| next one) are logged plainly; nothing here marks the direction    |
-//| done except an actual order placement (see ASB_EA_PlaceEntry).    |
+//| Evaluate every enabled filter for one event: true = all passed.   |
+//| Skips (no trade this bar, may retry the next one) are logged      |
+//| plainly; nothing here marks the direction done - only an actual   |
+//| order placement does.                                             |
 //+------------------------------------------------------------------+
-void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const string why)
+bool ASB_EA_FiltersOK(const int k, const ASBEvent &ev, const int qstat, const string why)
   {
    string dirtxt = g_s[k].name + ((ev.dir > 0) ? " BULL" : " BEAR");
 
@@ -2681,7 +2717,7 @@ void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const str
          if(!ASB_EA_ReadBuf(g_s[k].obv_handle, 0, 1, obv_now) || !ASB_EA_ReadBuf(g_s[k].obv_ema_handle, 0, 1, obv_ema))
            {
             PrintFormat("MSB EA: %s skipped - OBV/EMA data not ready.", dirtxt);
-            return;
+            return false;
            }
          if(!CRTOBV_PassEma(obv_now, obv_ema, ev.dir)) obv_pass = false;
         }
@@ -2690,14 +2726,14 @@ void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const str
          if(!needEma && !ASB_EA_ReadBuf(g_s[k].obv_handle, 0, 1, obv_now))
            {
             PrintFormat("MSB EA: %s skipped - OBV data not ready.", dirtxt);
-            return;
+            return false;
            }
          double obv_past = 0;
          int back = 1 + MathMax(g_s[k].obv_slope, 1);
          if(!ASB_EA_ReadBuf(g_s[k].obv_handle, 0, back, obv_past))
            {
             PrintFormat("MSB EA: %s skipped - OBV history not ready.", dirtxt);
-            return;
+            return false;
            }
          if(!CRTOBV_PassSlope(obv_now, obv_past, ev.dir)) obv_pass = false;
         }
@@ -2710,7 +2746,7 @@ void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const str
       if(!ASB_EA_BuiltInValueArea(k, va_vah, va_poc, va_val))
         {
          PrintFormat("MSB EA: %s skipped - Value Area levels not ready.", dirtxt);
-         return;
+         return false;
         }
       bool needDir  = (g_s[k].va_mode == VA_DIRECTION  || g_s[k].va_mode == VA_BOTH);
       bool needConf = (g_s[k].va_mode == VA_CONFLUENCE || g_s[k].va_mode == VA_BOTH);
@@ -2735,7 +2771,7 @@ void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const str
       if(!ASB_EA_DollarDirection(k, dollar_dir))
         {
          PrintFormat("MSB EA: %s skipped - USDX data not ready.", dirtxt);
-         return;
+         return false;
         }
       usdx_allowed = ASB_EA_AllowedFromDollar(dollar_dir, g_s[k].usdx_invert);
      }
@@ -2749,17 +2785,26 @@ void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const str
                   (g_s[k].use_obv ? "on" : "off"), (obv_pass ? "pass" : "fail"),
                   (g_s[k].use_va ? "on" : "off"), (va_pass ? "pass" : "fail"),
                   (g_s[k].use_usdx ? "on" : "off"), usdx_allowed);
-      return;
+      return false;
      }
 
    long spread_pts = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread_pts > g_s[k].max_spread)
      {
       PrintFormat("MSB EA: %s skipped - spread %d points over the %d limit.", dirtxt, (int)spread_pts, g_s[k].max_spread);
-      return;
+      return false;
      }
 
-   ASB_EA_PlaceEntry(k, ev);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| The normal breakout entry: every filter must pass, then place it. |
+//+------------------------------------------------------------------+
+void ASB_EA_TryEnter(const int k, const ASBEvent &ev, const int qstat, const string why)
+  {
+   if(ASB_EA_FiltersOK(k, ev, qstat, why))
+      ASB_EA_PlaceEntry(k, ev);
   }
 
 //+------------------------------------------------------------------+
@@ -3019,5 +3064,217 @@ void ASB_EA_PlaceEntry(const int k, const ASBEvent &ev)
      }
 
    PrintFormat("MSB EA: %s limit order FAILED, retcode=%u %s.", dirtxt, retcode, trade.ResultRetcodeDescription());
+  }
+//+------------------------------------------------------------------+
+//| WICK-BREAK ENTRY                                                  |
+//|                                                                  |
+//| Break candle: a closed candle (after the session has ended) whose |
+//| wick goes beyond the session high/low while the candle before it  |
+//| had not - the candle that first pokes through the level.          |
+//| Trigger price: the break candle's wick tip, plus the set % of its |
+//| body further in the break direction.                              |
+//|   Module A: during the very next candle, enter the moment the bid |
+//|             reaches the trigger. One attempt per candle.          |
+//|   Module B: when that next candle closes, enter if its CLOSE is   |
+//|             at or beyond the trigger.                             |
+//| Stop: beyond the confirming candle's opposite wick (for module A  |
+//| that is the wick as it stands at the moment of entry).            |
+//| Take profit, break-even and trailing: the session's own settings. |
+//| Every filter of the session (quality, OBV, Value Area, USDX,      |
+//| spread) applies, and a direction is still traded once per cycle.  |
+//+------------------------------------------------------------------+
+bool ASB_EA_IsBreakCandle(const MqlRates &sig[], const int i, const int dir, const double level, const datetime sess_end)
+  {
+   if(i < 1 || sig[i].time < sess_end)
+      return false;
+   if(dir > 0)
+      return (sig[i].high > level && sig[i - 1].high <= level);
+   return (sig[i].low < level && sig[i - 1].low >= level);
+  }
+
+double ASB_EA_WickBreakTrigger(const MqlRates &brk, const int dir, const double pct)
+  {
+   double body = MathAbs(brk.close - brk.open);
+   double add  = body * MathMax(pct, 0.0) / 100.0;
+   return (dir > 0) ? (brk.high + add) : (brk.low - add);
+  }
+
+//+------------------------------------------------------------------+
+//| Send the wick-break trade. `anchor` is the confirming candle's    |
+//| low (buys) or high (sells). True only when an order was placed.   |
+//+------------------------------------------------------------------+
+bool ASB_EA_WickBreakEnter(const int k, const int dir, const double anchor, const string module,
+                           const int qstat, const string why, const double range_hi, const double range_lo,
+                           const datetime day_end, const int day_idx)
+  {
+   string side   = (dir > 0) ? "BUY" : "SELL";
+   string dirtxt = g_s[k].name + " " + side + " wick-break " + module;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double price = (dir > 0) ? ask : bid;
+
+   ASBEvent ev;
+   ev.day_idx    = day_idx;
+   ev.dir        = dir;
+   ev.time       = iTime(_Symbol, g_s[k].sig_tf, 0);
+   ev.entry_time = TimeCurrent();
+   ev.entry      = price;
+   ev.range_hi   = range_hi;
+   ev.range_lo   = range_lo;
+   ev.day_end    = day_end;
+   if(!ASB_EA_FiltersOK(k, ev, qstat, why))
+      return false;
+
+   // Stop beyond the confirming candle's wick. Candle highs are bid prices but a
+   // sell is stopped out on the ask, so a sell's stop also clears the spread.
+   double sl = anchor - dir * InpWB_SLBufferPips * g_pip;
+   if(dir < 0)
+      sl += (ask - bid);
+   double sl_dist  = (price - sl) * dir;
+   double min_dist = InpWB_MinSLPips * g_pip;
+   if(sl_dist < min_dist)
+     {
+      PrintFormat("MSB EA: %s - the wick is only %.1f pips away, stop widened to the %.1f pip minimum.",
+                  dirtxt, MathMax(sl_dist, 0.0) / g_pip, InpWB_MinSLPips);
+      sl_dist = min_dist;
+      sl = price - dir * sl_dist;
+     }
+   double tp_dist = g_s[k].tp_pips * g_pip;
+
+   trade.SetExpertMagicNumber((ulong)g_s[k].magic);
+   bool lots_ok = true;
+   double lots = ASB_EA_LotsFor(k, sl_dist, lots_ok);
+   if(!lots_ok)
+     {
+      PrintFormat("MSB EA: %s skipped - no lot size could be worked out for this trade (see the line above).", dirtxt);
+      return false;
+     }
+   if(ASB_EA_HasOwnTradeForDir(k, dir))
+     {
+      PrintFormat("MSB EA: %s skipped - an own-magic position or pending order for this direction already exists (double-order guard).", dirtxt);
+      return false;
+     }
+   sl = NormalizeDouble(sl, _Digits);
+   double tp = NormalizeDouble(price + dir * tp_dist, _Digits);
+   if(!ASB_EA_StopsOK(price, sl, tp))
+     {
+      PrintFormat("MSB EA: %s skipped - SL/TP too close to price for the broker's stop level.", dirtxt);
+      return false;
+     }
+   string comment = g_s[k].tag + " W" + module + " " + side;
+   bool ok = (dir > 0) ? trade.Buy(lots, _Symbol, 0.0, sl, tp, comment)
+                       : trade.Sell(lots, _Symbol, 0.0, sl, tp, comment);
+   if(!ok)
+     {
+      PrintFormat("MSB EA: %s market order FAILED, retcode=%u %s.", dirtxt, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      return false;
+     }
+   ASB_EA_MarkDone(k, dir);
+   PrintFormat("MSB EA: %s market order sent at %s SL=%s (%.1f pips) TP=%s.", dirtxt,
+               DoubleToString(price, _Digits), DoubleToString(sl, _Digits), sl_dist / g_pip, DoubleToString(tp, _Digits));
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Once per closed signal bar: module B's close check on the bar     |
+//| that just closed, and arming module A for the bar now forming.    |
+//+------------------------------------------------------------------+
+void ASB_EA_WickBreakOnBar(const int k, const MqlRates &sig[], const int got, const ASBDay &days[], const ASBEvent &events[],
+                           const int today, const int day_status, const bool ma_ok, const double ma_val)
+  {
+   // A new candle has opened: whatever module A was waiting for has expired.
+   g_s[k].wb_bar     = 0;
+   g_s[k].wb_trig_up = 0.0;
+   g_s[k].wb_trig_dn = 0.0;
+
+   if(got < 3 || !days[today].has_range)
+      return;
+   if(TimeCurrent() >= days[today].day_end)
+      return;                                   // the breakout window has closed
+
+   int g = got - 1;                             // the candle that just closed
+   int p = got - 2;                             // the one before it
+   double hi = days[today].high, lo = days[today].low;
+
+   for(int dir = +1; dir >= -1; dir -= 2)
+     {
+      if((dir > 0) ? g_s[k].bull_done : g_s[k].bear_done)
+         continue;
+      double level = (dir > 0) ? hi : lo;
+      string side  = g_s[k].name + ((dir > 0) ? " BUY" : " SELL");
+
+      ASBQuality q;
+      ASB_EA_BuildQuality(k, sig, got, days, events, today, day_status, dir, ma_ok, ma_val, q);
+      string why;
+      int qstat = ASB_QualityStatus(q, why);
+
+      // Module B: p broke the level, g had to close past p's wick.
+      if(InpWB_UseB && ASB_EA_IsBreakCandle(sig, p, dir, level, days[today].sess_end))
+        {
+         double trig = ASB_EA_WickBreakTrigger(sig[p], dir, InpWB_PctB);
+         bool confirmed = (dir > 0) ? (sig[g].close >= trig) : (sig[g].close <= trig);
+         if(confirmed)
+            ASB_EA_WickBreakEnter(k, dir, (dir > 0) ? sig[g].low : sig[g].high, "B", qstat, why, hi, lo,
+                                  days[today].day_end, today);
+         else
+            PrintFormat("MSB EA: %s wick-break B - break candle %s not confirmed: the next candle closed at %s, needed %s.",
+                        side, TimeToString(sig[p].time, TIME_DATE | TIME_MINUTES),
+                        DoubleToString(sig[g].close, _Digits), DoubleToString(trig, _Digits));
+        }
+
+      // Module A: g broke the level - watch the candle forming now.
+      if(InpWB_UseA && !((dir > 0) ? g_s[k].bull_done : g_s[k].bear_done)
+         && ASB_EA_IsBreakCandle(sig, g, dir, level, days[today].sess_end))
+        {
+         double trig = ASB_EA_WickBreakTrigger(sig[g], dir, InpWB_PctA);
+         g_s[k].wb_bar      = iTime(_Symbol, g_s[k].sig_tf, 0);
+         g_s[k].wb_range_hi = hi;
+         g_s[k].wb_range_lo = lo;
+         g_s[k].wb_day_end  = days[today].day_end;
+         g_s[k].wb_day_idx  = today;
+         if(dir > 0)
+           { g_s[k].wb_trig_up = trig; g_s[k].wb_q_up = qstat; g_s[k].wb_why_up = why; }
+         else
+           { g_s[k].wb_trig_dn = trig; g_s[k].wb_q_dn = qstat; g_s[k].wb_why_dn = why; }
+         PrintFormat("MSB EA: %s wick-break A armed - break candle %s, enters if price reaches %s during this candle.",
+                     side, TimeToString(sig[g].time, TIME_DATE | TIME_MINUTES), DoubleToString(trig, _Digits));
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Every tick: module A. Fires when the bid reaches an armed trigger |
+//| during the candle it was armed for. One attempt per candle and    |
+//| direction, whether the order goes through or a filter blocks it.  |
+//+------------------------------------------------------------------+
+void ASB_EA_WickBreakTick()
+  {
+   if(!InpWB_UseA)
+      return;
+   for(int k = 0; k < MSB_SESSIONS; k++)
+     {
+      if(!g_s[k].use || g_s[k].wb_bar == 0)
+         continue;
+      if(iTime(_Symbol, g_s[k].sig_tf, 0) != g_s[k].wb_bar || TimeCurrent() >= g_s[k].wb_day_end)
+        {
+         g_s[k].wb_bar = 0;                     // that candle is over, or the window closed
+         continue;
+        }
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(g_s[k].wb_trig_up > 0.0 && bid >= g_s[k].wb_trig_up)
+        {
+         g_s[k].wb_trig_up = 0.0;
+         if(!g_s[k].bull_done)
+            ASB_EA_WickBreakEnter(k, +1, iLow(_Symbol, g_s[k].sig_tf, 0), "A", g_s[k].wb_q_up, g_s[k].wb_why_up,
+                                  g_s[k].wb_range_hi, g_s[k].wb_range_lo, g_s[k].wb_day_end, g_s[k].wb_day_idx);
+        }
+      if(g_s[k].wb_trig_dn > 0.0 && bid <= g_s[k].wb_trig_dn)
+        {
+         g_s[k].wb_trig_dn = 0.0;
+         if(!g_s[k].bear_done)
+            ASB_EA_WickBreakEnter(k, -1, iHigh(_Symbol, g_s[k].sig_tf, 0), "A", g_s[k].wb_q_dn, g_s[k].wb_why_dn,
+                                  g_s[k].wb_range_hi, g_s[k].wb_range_lo, g_s[k].wb_day_end, g_s[k].wb_day_idx);
+        }
+     }
   }
 //+------------------------------------------------------------------+
