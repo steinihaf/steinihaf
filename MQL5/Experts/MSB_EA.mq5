@@ -23,11 +23,15 @@
 //| Module B waits for it to CLOSE there. The stop goes beyond the    |
 //| confirming candle's own wick. See "Wick-break entry" inputs.      |
 //|                                                                  |
+//| CANDLE EXITS (optional, off by default): close a trade after a    |
+//| set number of candles, and/or when a candle against the trade     |
+//| closes with a body bigger than the candle before it.              |
+//|                                                                  |
 //| ONE FILE: needs no include folder and no indicator files.        |
 //| NEW AND UNTESTED: Strategy Tester and demo first.                |
 //+------------------------------------------------------------------+
 #property copyright "Stein"
-#property version   "1.11"
+#property version   "1.12"
 
 #include <Trade\Trade.mqh>
 
@@ -103,6 +107,13 @@ input double InpWB_PctB          = 15;                   // Module B: % of the b
 input double InpWB_SLBufferPips  = 0;                    // Wick-break: stop this many pips beyond the confirming candle's wick (0 = exactly on the wick)
 input double InpWB_MinSLPips     = 0;                    // Wick-break: smallest stop distance allowed (pips); 0 = no minimum of your own
 input bool   InpWB_KeepNormalEntry = false;              // Wick-break: false = replaces the normal breakout entry while A or B is on, true = both run
+
+input group "=== Candle exits (all sessions; candles of each session's signal timeframe) ==="
+input bool   InpEX_UseBars       = false;                // Exit after N candles on/off
+input int    InpEX_Bars          = 5;                    // Exit after this many candles have closed since the entry (the entry candle counts as 1)
+input bool   InpEX_UseOpposite   = false;                // Exit on an opposite candle on/off
+input double InpEX_OppositePct   = 100;                  // Opposite candle: its body must exceed this % of the previous candle's body (100 = bigger than it)
+input bool   InpEX_WickBreakOnly = true;                 // Candle exits apply to: true = wick-break trades only, false = every trade of this EA
 
 input group "=============== ASIA SESSION ==============="
 input bool                InpAS_Use              = true;           // Asia: trade this session's breakout
@@ -2693,6 +2704,7 @@ void ASB_EA_OnNewSignalBar(const int k)
         }
      }
 
+   ASB_EA_CandleExits(k, sig, got, tf_sec);   // before any new entry is considered
    ASB_EA_ProcessSession(k, sig, got, tf_sec, ma_ok, ma_val);
   }
 
@@ -3279,6 +3291,69 @@ void ASB_EA_WickBreakTick()
             ASB_EA_WickBreakEnter(k, -1, iHigh(_Symbol, g_s[k].sig_tf, 0), "A", g_s[k].wb_q_dn, g_s[k].wb_why_dn,
                                   g_s[k].wb_range_hi, g_s[k].wb_range_lo, g_s[k].wb_day_end, g_s[k].wb_day_idx);
         }
+     }
+  }
+//+------------------------------------------------------------------+
+//| CANDLE EXITS - checked once per closed signal bar, per session.   |
+//|   After N candles: closes the trade once N signal candles have    |
+//|     closed since it was opened; the candle it was opened in       |
+//|     counts as the first.                                          |
+//|   Opposite candle: closes the trade when the candle that just     |
+//|     closed goes against it (bullish for a sell, bearish for a     |
+//|     buy) and its body is larger than the set % of the body of the |
+//|     candle before it.                                             |
+//| Both act at the close of a candle, at market. Stop-loss, take     |
+//| profit, break-even and trailing keep working alongside them.      |
+//+------------------------------------------------------------------+
+void ASB_EA_CandleExits(const int k, const MqlRates &sig[], const int got, const int tf_sec)
+  {
+   if((!InpEX_UseBars && !InpEX_UseOpposite) || got < 2)
+      return;
+   int last = got - 1;                                  // the candle that just closed
+   datetime last_close = sig[last].time + tf_sec;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != g_s[k].magic) continue;
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(InpEX_WickBreakOnly && StringFind(comment, " WA ") < 0 && StringFind(comment, " WB ") < 0)
+         continue;                                      // not a wick-break trade
+      datetime open_time = (datetime)PositionGetInteger(POSITION_TIME);
+      if(open_time >= last_close)
+         continue;                                      // opened after that candle closed
+      int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? +1 : -1;
+      string what = g_s[k].name + ((dir > 0) ? " BUY" : " SELL") + " #" + (string)ticket;
+
+      string reason = "";
+      if(InpEX_UseBars && InpEX_Bars > 0)
+        {
+         int closed = 0;                                // candles that closed after the entry
+         for(int b = last; b >= 0 && sig[b].time + tf_sec > open_time; b--)
+            closed++;
+         if(closed >= InpEX_Bars)
+            reason = StringFormat("%d candles have closed since the entry", closed);
+        }
+      if(reason == "" && InpEX_UseOpposite)
+        {
+         double body = MathAbs(sig[last].close - sig[last].open);
+         double prev = MathAbs(sig[last - 1].close - sig[last - 1].open);
+         bool against = (dir > 0) ? (sig[last].close < sig[last].open) : (sig[last].close > sig[last].open);
+         if(against && body > prev * MathMax(InpEX_OppositePct, 0.0) / 100.0)
+            reason = StringFormat("a candle against the trade closed with a body of %.1f pips, previous candle %.1f pips",
+                                  body / g_pip, prev / g_pip);
+        }
+      if(reason == "")
+         continue;
+
+      trade.SetExpertMagicNumber((ulong)g_s[k].magic);
+      if(trade.PositionClose(ticket))
+         PrintFormat("MSB EA: %s closed by candle exit - %s.", what, reason);
+      else
+         PrintFormat("MSB EA: %s candle exit FAILED (%s), retcode=%u %s - will try again next candle.",
+                     what, reason, trade.ResultRetcode(), trade.ResultRetcodeDescription());
      }
   }
 //+------------------------------------------------------------------+
