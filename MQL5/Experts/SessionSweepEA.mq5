@@ -14,10 +14,12 @@
 //|  A break that holds (price stays outside too long or runs too    |
 //|  far) is a real breakout and is NOT traded.                      |
 //|  All session times are broker SERVER time.                       |
+//|  Buffers and stops scale with the daily ATR, so the same inputs  |
+//|  work on forex, gold (XAUUSD) and indices.                       |
 //+------------------------------------------------------------------+
 #property copyright   "steinihaf"
 #property link        "https://github.com/steinihaf/steinihaf"
-#property version     "1.00"
+#property version     "1.10"
 #property description "Session range reversal: when a session high/low is broken and price"
 #property description "closes back inside the range, trade in the reversal direction."
 
@@ -84,8 +86,11 @@ input int    InpMaxRangePoints    = 0;              // Skip ranges larger than N
 input group "=== Break and reversal ==="
 input ENUM_TIMEFRAMES InpSignalTF = PERIOD_CURRENT; // Signal timeframe (Current = chart)
 input ENUM_SS_BREAK InpBreakMode  = SS_BREAK_WICK;  // What counts as a break
-input int    InpBreakBufferPoints = 10;             // Price must exceed the level by N points to count as a break
-input int    InpReentryBufferPoints = 0;            // Bar must close back inside the range by N points
+input int    InpATRPeriod         = 14;             // Daily ATR period (scales the buffers to the symbol: forex, gold, indices)
+input double InpBreakBufferATR    = 0.01;           // Break buffer: price must exceed the level by N x daily ATR
+input int    InpBreakBufferPoints = 0;              // ...and by at least N points (the larger of the two is used)
+input double InpReentryBufferATR  = 0.0;            // Re-entry buffer: bar must close back inside by N x daily ATR
+input int    InpReentryBufferPoints = 0;            // ...and by at least N points
 input int    InpMaxBarsOutside    = 6;              // Reversal must come within N bars of the break (else: real breakout, no trade)
 input double InpMaxSweepPercent   = 50.0;           // Break may run at most N% of the range beyond the level (0 = off)
 input ENUM_SS_PERMIT InpPermit    = SS_PERMIT_BOTH; // Allowed directions
@@ -94,17 +99,21 @@ input group "=== Risk ==="
 input ENUM_SS_LOT InpLotMode      = SS_LOT_RISK;    // Lot sizing
 input double InpFixedLot          = 0.10;           // Fixed lot
 input double InpRiskPercent       = 0.5;            // Risk per trade (% of balance)
-input int    InpSLBufferPoints    = 30;             // Stop-loss buffer beyond the break extreme (points)
-input int    InpMinSLPoints       = 50;             // Minimum stop distance (points, stop is widened to this)
-input int    InpMaxSLPoints       = 0;              // Skip the trade if the stop would be wider (0 = off)
+input double InpSLBufferATR       = 0.03;           // Stop-loss buffer beyond the break extreme: N x daily ATR
+input int    InpSLBufferPoints    = 0;              // ...and at least N points
+input double InpMinSLATR          = 0.06;           // Minimum stop distance: N x daily ATR (stop is widened to this)
+input int    InpMinSLPoints       = 0;              // ...and at least N points
+input double InpMaxSLATR          = 0.0;            // Skip the trade if the stop is wider than N x daily ATR (0 = off)
+input int    InpMaxSLPoints       = 0;              // Skip the trade if the stop is wider than N points (0 = off)
 input ENUM_SS_TP InpTPMode        = SS_TP_RR;       // Take-profit
 input double InpTPRR              = 2.0;            // Take-profit R multiple (R mode)
 input double InpMinRR             = 1.0;            // Middle / Opposite: skip when reward / risk is below N (0 = off)
 input double InpBreakEvenRR       = 1.0;            // Move stop to break-even after N x R profit (0 = off)
-input int    InpBreakEvenLockPoints = 10;           // Break-even lock (points)
+input double InpBreakEvenLockR    = 0.05;           // Break-even lock: stop goes N x R beyond the entry
 
 input group "=== Limits ==="
 input int    InpMaxSpreadPoints   = 0;              // Max spread (points, 0 = off)
+input double InpMaxSpreadPercentOfSL = 15.0;        // Max spread as % of the stop distance (0 = off)
 input int    InpMaxOpenPositions  = 1;              // Open positions at once (this EA, this symbol)
 input int    InpMaxTradesPerDay   = 3;              // Max new trades per day (0 = off)
 input double InpMaxDailyLossPercent = 2.0;          // Stop for the day after losing N% of balance (0 = off)
@@ -112,7 +121,7 @@ input string InpCloseTime         = "";             // Close all and stop tradin
 
 input group "=== General ==="
 input long   InpMagic             = 20261124;       // Magic number
-input int    InpDeviationPoints   = 30;             // Max slippage (points)
+input int    InpDeviationPoints   = 0;              // Max slippage (points, 0 = auto: 2 x spread, at least 10)
 input bool   InpDraw              = true;           // Draw session boxes, levels and signals
 input bool   InpAlerts            = false;          // Alert on every signal
 input bool   InpDashboard         = true;           // Show status on the chart
@@ -145,6 +154,8 @@ CTrade          g_trade;
 ENUM_TIMEFRAMES g_tf        = PERIOD_CURRENT;
 datetime        g_lastBar   = 0;
 int             g_closeMin  = -1;
+int             g_atrHandle = INVALID_HANDLE;
+double          g_atr       = 0.0;      // last completed daily ATR, 0 until history is ready
 string          g_lastNote  = "";
 
 //+------------------------------------------------------------------+
@@ -158,6 +169,19 @@ void Note(const string msg, const bool always = false)
   }
 
 double Pts(const int points)        { return points * _Point; }
+
+// A distance that scales with the symbol: the larger of N points and a fraction of the daily ATR.
+double Dist(const int points, const double atrFraction)
+  {
+   return MathMax(points * _Point, g_atr * atrFraction);
+  }
+
+void RefreshATR()
+  {
+   double buf[];
+   if(g_atrHandle != INVALID_HANDLE && CopyBuffer(g_atrHandle, 0, 1, 1, buf) == 1 && buf[0] > 0.0)
+      g_atr = buf[0];
+  }
 string PriceStr(const double p)     { return DoubleToString(p, _Digits); }
 
 double RoundToTick(const double price)
@@ -367,15 +391,18 @@ bool OpenReversal(const SSession &S, const int side, const double extreme)
 
    // Stop beyond the extreme of the failed break. A sell stop is hit by the ask, so add the spread.
    double entry = sell ? bid : ask;
-   double sl    = sell ? extreme + Pts(InpSLBufferPoints) + spread : extreme - Pts(InpSLBufferPoints);
-   double minDist = MathMax(Pts(InpMinSLPoints),
+   double slBuf = Dist(InpSLBufferPoints, InpSLBufferATR);
+   double sl    = sell ? extreme + slBuf + spread : extreme - slBuf;
+   double minDist = MathMax(Dist(InpMinSLPoints, InpMinSLATR),
                             (SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) + 1) * _Point + spread);
    if(MathAbs(sl - entry) < minDist || (sell && sl <= entry) || (!sell && sl >= entry))
       sl = sell ? entry + minDist : entry - minDist;
    sl = RoundToTick(sl);
    double risk = MathAbs(sl - entry);
-   if(InpMaxSLPoints > 0 && risk > Pts(InpMaxSLPoints))
+   if((InpMaxSLPoints > 0 && risk > Pts(InpMaxSLPoints)) || (InpMaxSLATR > 0.0 && g_atr > 0.0 && risk > g_atr * InpMaxSLATR))
      { Note(what + " skipped: stop " + DoubleToString(risk / _Point, 0) + " points is too wide"); return false; }
+   if(InpMaxSpreadPercentOfSL > 0.0 && spread > risk * InpMaxSpreadPercentOfSL / 100.0)
+     { Note(what + " skipped: spread is " + DoubleToString(spread / risk * 100.0, 0) + "% of the stop"); return false; }
 
    double tp = 0.0;
    if(InpTPMode == SS_TP_RR)
@@ -396,6 +423,8 @@ bool OpenReversal(const SSession &S, const int side, const double extreme)
    if(lots <= 0.0)
      { Note(what + " skipped: lot size below the symbol minimum for this risk", true); return false; }
 
+   if(InpDeviationPoints <= 0)
+      g_trade.SetDeviationInPoints((ulong)MathMax(10.0, 2.0 * spread / _Point));
    bool ok = sell ? g_trade.Sell(lots, _Symbol, 0.0, sl, tp, comment)
                   : g_trade.Buy(lots, _Symbol, 0.0, sl, tp, comment);
    uint rc = g_trade.ResultRetcode();
@@ -438,7 +467,7 @@ void ManagePositions()
       double gain  = buy ? price - open : open - price;
       if(gain < risk * InpBreakEvenRR)
          continue;
-      double newSL = RoundToTick(buy ? open + Pts(InpBreakEvenLockPoints) : open - Pts(InpBreakEvenLockPoints));
+      double newSL = RoundToTick(buy ? open + risk * InpBreakEvenLockR : open - risk * InpBreakEvenLockR);
       double stops = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
       if((buy && newSL > price - stops) || (!buy && newSL < price + stops))
          continue;
@@ -492,7 +521,8 @@ void ProcessBar(SSession &S, const MqlRates &bar, const bool live)
       if(S.state[side] == SS_ARMED)
         {
          double probe = (InpBreakMode == SS_BREAK_CLOSE) ? bar.close : (high ? bar.high : bar.low);
-         bool broke = high ? probe > level + Pts(InpBreakBufferPoints) : probe < level - Pts(InpBreakBufferPoints);
+         double brkBuf = Dist(InpBreakBufferPoints, InpBreakBufferATR);
+         bool broke = high ? probe > level + brkBuf : probe < level - brkBuf;
          if(!broke)
             continue;
          S.state[side] = SS_BROKEN;
@@ -517,8 +547,8 @@ void ProcessBar(SSession &S, const MqlRates &bar, const bool live)
          continue;
         }
 
-      bool back = high ? bar.close < level - Pts(InpReentryBufferPoints)
-                       : bar.close > level + Pts(InpReentryBufferPoints);
+      double reBuf = Dist(InpReentryBufferPoints, InpReentryBufferATR);
+      bool back = high ? bar.close < level - reBuf : bar.close > level + reBuf;
       if(back)
         {
          S.state[side] = SS_SPENT;                   // one reversal per side per session range
@@ -599,7 +629,8 @@ void Dashboard()
    if(!InpDashboard)
       return;
    datetime now = TimeCurrent();
-   string text = SS_NAME + "  " + _Symbol + " " + EnumToString(g_tf) + "\n";
+   string text = SS_NAME + "  " + _Symbol + " " + EnumToString(g_tf) + "   daily ATR "
+                 + (g_atr > 0.0 ? PriceStr(g_atr) : "not ready (point buffers only)") + "\n";
    for(int i = 0; i < SS_SESSIONS; i++)
      {
       if(!g_s[i].enabled)
@@ -657,7 +688,12 @@ int OnInit()
      }
 
    g_trade.SetExpertMagicNumber(InpMagic);
-   g_trade.SetDeviationInPoints(InpDeviationPoints);
+   if(InpDeviationPoints > 0)
+      g_trade.SetDeviationInPoints(InpDeviationPoints);
+   g_atrHandle = iATR(_Symbol, PERIOD_D1, MathMax(InpATRPeriod, 1));
+   if(g_atrHandle == INVALID_HANDLE)
+      Print(SS_NAME, ": daily ATR is unavailable, only the point-based buffers are used");
+   g_atr = 0.0;
    g_trade.SetTypeFillingBySymbol(_Symbol);
    g_lastBar = 0;
    return INIT_SUCCEEDED;
@@ -667,6 +703,9 @@ void OnDeinit(const int reason)
   {
    if(InpDashboard)
       Comment("");
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+   g_atrHandle = INVALID_HANDLE;
    if(!MQLInfoInteger(MQL_TESTER))
       ObjectsDeleteAll(0, SS_PREFIX);
   }
@@ -682,6 +721,7 @@ void OnTick()
    if(lastClosed == 0)
       return;
    g_lastBar = now;
+   RefreshATR();
 
    for(int i = 0; i < SS_SESSIONS; i++)
       UpdateSession(g_s[i], now, lastClosed);

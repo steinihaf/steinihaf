@@ -309,8 +309,10 @@ side of each session range is traded at most once.
 | `InpAsia/London/NY Enable, Start, End` | see above | Which session ranges to trade and when they run |
 | `InpRangeValidHours` | 10 | A range can be traded for this long after its session ends |
 | `InpBreakMode` | Wick | *Wick*: any trade beyond the level is a break (a single sweep candle can signal). *Close*: a bar must first close beyond the level |
-| `InpBreakBufferPoints` | 10 | How far beyond the level price must go to count as a break |
-| `InpReentryBufferPoints` | 0 | How far back inside the range the reversal bar must close |
+| `InpBreakBufferATR` | 0.01 | How far beyond the level price must go to count as a break, as a fraction of the daily ATR |
+| `InpReentryBufferATR` | 0 | How far back inside the range the reversal bar must close |
+| `InpSLBufferATR`, `InpMinSLATR` | 0.03, 0.06 | Stop buffer beyond the break extreme, and the minimum stop distance |
+| `InpMaxSpreadPercentOfSL` | 15 | Skip the trade when the spread is more than this % of the stop distance |
 | `InpMaxBarsOutside` | 6 | Reversal must come within this many bars of the break |
 | `InpMaxSweepPercent` | 50 | The break may run at most this % of the range beyond the level |
 | `InpLotMode`, `InpRiskPercent`, `InpFixedLot` | Risk, 0.5 % | Position size; in risk mode the trade is skipped if even the minimum lot would risk more |
@@ -319,8 +321,13 @@ side of each session range is traded at most once.
 | `InpMaxTradesPerDay`, `InpMaxDailyLossPercent`, `InpMaxOpenPositions` | 3, 2 %, 1 | Daily and exposure limits |
 | `InpCloseTime` | off | Close everything and stop trading at this server time |
 
-Point-based inputs (buffers, minimum stop) are in symbol points; the defaults suit 5-digit
-forex pairs and need to be scaled up for gold or indices.
+**Forex, gold and indices use the same inputs.** Every buffer and stop distance is a
+fraction of the symbol's daily ATR (`InpATRPeriod`, default 14), so it sizes itself: with a
+daily ATR of 80 pips on EURUSD the break buffer is 0.8 pips and the minimum stop 4.8 pips;
+with a daily ATR of $40 on XAUUSD they are $0.40 and $2.40. Each distance also has a
+`...Points` input (default 0) that acts as a floor if you want a fixed minimum. Slippage
+tolerance defaults to twice the current spread, and the break-even lock is a fraction of
+the trade's risk, so neither needs per-symbol tuning.
 
 The EA draws each session box, its high / low lines while they are tradable, and an arrow
 on every signal (grey when the signal was filtered out). The chart comment shows the state
