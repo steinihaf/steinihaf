@@ -10,6 +10,7 @@ lines; that touch is the EA's signal.
 MQL5/Experts/LineTouchEA.mq5                         the Expert Advisor (single file)
 MQL5/Presets/LineTouchEA_XAUUSD_H1_chart_lines.set   preset: trade the lines already on the chart
 MQL5/Presets/LineTouchEA_XAUUSD_H1_builtin.set       preset: self-contained levels (for backtesting)
+MQL5/Experts/SessionSweepEA.mq5                      second EA: session range reversal (see the end of this file)
 tools/gen_presets.py                                 regenerates the presets from the EA's inputs
 tools/mqlcheck/                                      g++-based syntax check used while developing
 ```
@@ -274,3 +275,57 @@ change the inputs.
 | | `InpPersistState` | true | save level state to a file |
 | | `InpAlerts`, `InpPushNotifications` | false | notifications |
 | | `InpLogLevel` | Normal | Errors / Normal / Verbose |
+
+---
+
+# SessionSweepEA — trade the failed break of a session range
+
+`MQL5/Experts/SessionSweepEA.mq5` is a separate, standalone Expert Advisor. It records the
+high and low of the Asian, London and New York sessions and waits for price to break out
+of a finished session's range **and come back**. It trades the reversal, never the break:
+
+| What happens | Trade |
+|---|---|
+| Price breaks **above** the session high, then a bar closes back below it | **SELL** |
+| Price breaks **below** the session low, then a bar closes back above it | **BUY** |
+| Price breaks out and stays out (`InpMaxBarsOutside` bars) or runs too far (`InpMaxSweepPercent` of the range) | no trade: real breakout |
+
+The stop-loss goes beyond the extreme of the failed break plus `InpSLBufferPoints`. Each
+side of each session range is traded at most once.
+
+## Setup
+
+1. Copy the file into `<terminal data folder>\MQL5\Experts\`, compile it in MetaEditor (F7).
+2. Attach it to an M5 - M30 chart (the chart timeframe is the signal timeframe unless
+   `InpSignalTF` says otherwise).
+3. **Check the session times.** They are broker *server* time. The defaults (Asia
+   02:00-10:00, London 10:00-16:30, New York 16:30-23:00) fit a GMT+2 / GMT+3 server,
+   which most forex / CFD brokers use. Compare with the clock in Market Watch and adjust.
+
+## Main inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `InpAsia/London/NY Enable, Start, End` | see above | Which session ranges to trade and when they run |
+| `InpRangeValidHours` | 10 | A range can be traded for this long after its session ends |
+| `InpBreakMode` | Wick | *Wick*: any trade beyond the level is a break (a single sweep candle can signal). *Close*: a bar must first close beyond the level |
+| `InpBreakBufferPoints` | 10 | How far beyond the level price must go to count as a break |
+| `InpReentryBufferPoints` | 0 | How far back inside the range the reversal bar must close |
+| `InpMaxBarsOutside` | 6 | Reversal must come within this many bars of the break |
+| `InpMaxSweepPercent` | 50 | The break may run at most this % of the range beyond the level |
+| `InpLotMode`, `InpRiskPercent`, `InpFixedLot` | Risk, 0.5 % | Position size; in risk mode the trade is skipped if even the minimum lot would risk more |
+| `InpTPMode` | R multiple (2.0) | Or: middle of the range, opposite side of the range, none |
+| `InpBreakEvenRR` | 1.0 | Move the stop to break-even after this many R of profit |
+| `InpMaxTradesPerDay`, `InpMaxDailyLossPercent`, `InpMaxOpenPositions` | 3, 2 %, 1 | Daily and exposure limits |
+| `InpCloseTime` | off | Close everything and stop trading at this server time |
+
+Point-based inputs (buffers, minimum stop) are in symbol points; the defaults suit 5-digit
+forex pairs and need to be scaled up for gold or indices.
+
+The EA draws each session box, its high / low lines while they are tradable, and an arrow
+on every signal (grey when the signal was filtered out). The chart comment shows the state
+of every level and the reason the last signal was skipped. After a restart the EA replays
+the bars since the session ended, so it does not re-trade a level that already fired.
+
+This EA has passed the `tools/mqlcheck` syntax check only. Compile it in MetaEditor and
+run it in the Strategy Tester and on a demo account before trading it live.
