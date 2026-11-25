@@ -20,17 +20,19 @@ KNOWN = {
 
 # SessionSweepEA: lines shared by the three presets
 SWEEP_NOTES = [
-    'Signal timeframe is fixed to M15 (InpSignalTF), so the chart timeframe does not matter.',
+    'Signal timeframe is fixed to M15 (InpSignalTF), so on a live chart the chart timeframe does not matter.',
+    'In the Strategy Tester choose M15 or lower and "Every tick" or "1 minute OHLC".',
     'Session times are broker server time for a GMT+2 / GMT+3 server (New York time + 7 hours):',
     'compare with the clock in Market Watch and adjust InpAsia / InpLondon / InpNY Start and End.',
     'The file is not tied to the symbol name; load it on your broker\'s chart of this instrument.',
     'Backtests of these values showed no proven edge. Run it on a demo account first.',
 ]
 
-# EA source file -> {'newline': line ending of its presets, 'presets': {file name: comment + overrides}}
+# EA source file -> {'newline' and 'encoding' of its presets, 'presets': {file name: comment + overrides}}
 EAS = {
     'LineTouchEA.mq5': {
         'newline': '\n',
+        'encoding': 'ascii',
         'presets': {
             'LineTouchEA_XAUUSD_H1_chart_lines.set': {
                 'comment': ['LineTouchEA preset - trade the lines already on the chart (XAUUSD H1)',
@@ -48,7 +50,8 @@ EAS = {
         },
     },
     'SessionSweepEA.mq5': {
-        'newline': '\r\n',              # as MetaTrader writes its own .set files
+        'newline': '\r\n',              # CRLF and UTF-16 LE with a byte-order mark:
+        'encoding': 'utf-16',           # the form in which MetaTrader 5 saves its own .set files
         'presets': {
             'SessionSweepEA_XAUUSD_M15.set': {
                 'comment': ['SessionSweepEA preset - XAUUSD (gold)',
@@ -93,6 +96,9 @@ def parse_ea(path):
             val += 1
         enums[name] = members
     inputs = re.findall(r'^input\s+(\w+)\s+(Inp\w+)\s*=\s*([^;]+);', src, re.M)
+    declared = len(re.findall(r'^\s*s?input\s+(?!group\b)', src, re.M))
+    if declared != len(inputs):
+        raise SystemExit(f'{path.name}: {declared} input declarations, but only {len(inputs)} were understood')
     return enums, inputs
 
 
@@ -133,5 +139,8 @@ for ea, cfg in EAS.items():
             value = spec['overrides'].get(name, default)
             lines.append(encode(enums, typ, name, value))
         nl = cfg['newline']
-        (OUT / fname).write_bytes((nl.join(lines) + nl).encode('ascii'))
+        text = nl.join(lines) + nl
+        text.encode('ascii')            # presets stay plain ASCII text whatever the file encoding
+        bom = b'\xff\xfe' if cfg['encoding'] == 'utf-16' else b''
+        (OUT / fname).write_bytes(bom + text.encode('utf-16-le' if bom else 'ascii'))
         print(f'{fname}: {len(inputs)} inputs')

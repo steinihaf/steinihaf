@@ -334,9 +334,15 @@ the trade's risk, so neither needs per-symbol tuning.
 
 ## Presets for gold, EURUSD and GBPUSD
 
-Copy the files from `MQL5/Presets/` to `<terminal data folder>\MQL5\Presets\` and pick one
-with the **Load** button of the EA's input dialog. A preset is not tied to the symbol name,
-so it also fits a broker that calls gold `GOLD` or adds a suffix such as `EURUSD.m`.
+Copy the files from `MQL5/Presets/` to `<terminal data folder>\MQL5\Presets\` (in MetaTrader:
+*File - Open Data Folder*) and pick one with the **Load** button of the EA's input dialog.
+In the Strategy Tester the button is in the right-click menu of the *Inputs* tab and its
+window starts in `MQL5\Profiles\Tester`, so copy the files there too or browse to
+`MQL5\Presets`. After loading, check that *Signal timeframe* shows M15 and, on EURUSD and
+GBPUSD, that *Minimum stop distance* shows 0.25: if they do, the preset was read. A preset
+is not tied to the symbol name, so it also fits a broker that calls gold `GOLD` or adds a
+suffix such as `EURUSD.m`. The files are saved the way MetaTrader saves its own presets
+(UTF-16), so GitHub shows them as binary.
 
 | File | Chart | What differs from the EA defaults |
 |---|---|---|
@@ -345,24 +351,33 @@ so it also fits a broker that calls gold `GOLD` or adds a suffix such as `EURUSD
 | `SessionSweepEA_GBPUSD_M15.set` | GBPUSD | `InpSignalTF` = M15, `InpMinSLATR` = 0.25 |
 
 * **Signal timeframe M15.** It is fixed in the presets so the EA behaves the same on any
-  chart timeframe. Set `InpSignalTF` to M5 if you prefer; the backtests could not tell M5
-  and M15 apart.
-* **Minimum stop 0.25 on forex.** With the default 0.06 a forex stop is only about 8 - 11
+  live chart timeframe. Set `InpSignalTF` to M5 if you prefer; the backtests could not
+  tell M5 and M15 apart. In the Strategy Tester choose M15 or lower and *Every tick* or
+  *1 minute OHLC*; with *Open prices only* on a higher timeframe most signals are lost.
+* **Minimum stop 0.25 on forex.** With the default 0.06 a forex stop is only about 9 - 13
   pips: the spread is then about 10 % of the risk and the spread filter
-  (`InpMaxSpreadPercentOfSL`) skips a third to half of the signals. With 0.25 the stop is
-  about 15 - 19 pips. Trades stay open longer, some overnight.
+  (`InpMaxSpreadPercentOfSL`) skips a fifth to a third of the signals (a third to half on
+  M5). With 0.25 the stop is about 15 - 19 pips. Trades stay open longer: about a third
+  stay open overnight and a few over the weekend, and swap is not in the backtests.
 * **The other buffers stay at the defaults** (break 0.01, re-entry 0, stop buffer 0.03): no
-  other value tested better on any of the three instruments. A break buffer below 0.01
-  tested worse on all three.
+  other value tested reliably better on any of the three instruments; all differences
+  were within noise.
+* **Account size.** With `InpRiskPercent` 0.5 the EA skips a trade when even the smallest
+  lot would risk more than 0.5 % of the balance (log: *lot size below the symbol minimum
+  for this risk*). With a 0.01 minimum lot on a USD account, the gold preset needs a
+  balance of roughly 2,000 USD or more to take about half of its signals (5,000 USD for
+  nine in ten); the forex presets need about 300 - 500 USD. A Strategy Tester run with the
+  default deposit does not show this.
 
 These values come from backtests of a re-implementation of the EA's rules on 5-minute
 data with an assumed spread and no commission, swap or slippage. They found **no proven
 edge**: with these values every result was within noise of zero (gold about +0.06 to
-+0.10 R per trade, EURUSD and GBPUSD about +0.04 to +0.09 R), and gold fell to about zero
-with a wider spread and slippage. With the default minimum stop EURUSD lost 0.07 to 0.20 R
-per trade.
++0.10 R per trade, EURUSD and GBPUSD about +0.04 to +0.09 R), and all three fell to about
+zero or slightly below with a wider spread, slippage and longer candle wicks. With the
+default minimum stop EURUSD lost 0.07 to 0.20 R per trade.
 All three charts may share the same `InpMagic`: the EA counts positions and daily limits
-per symbol, so three charts can lose about 3 x `InpMaxDailyLossPercent` in a day.
+per symbol. With these presets one chart can lose about 1.5 % of the balance in a day
+(3 trades x 0.5 %), three charts about 4.5 %.
 
 The EA draws each session box, its high / low lines while they are tradable, and an arrow
 on every signal (grey when the signal was filtered out). The chart comment shows the state

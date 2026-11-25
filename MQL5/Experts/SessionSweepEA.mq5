@@ -19,7 +19,7 @@
 //+------------------------------------------------------------------+
 #property copyright   "steinihaf"
 #property link        "https://github.com/steinihaf/steinihaf"
-#property version     "1.10"
+#property version     "1.11"
 #property description "Session range reversal: when a session high/low is broken and price"
 #property description "closes back inside the range, trade in the reversal direction."
 
@@ -369,6 +369,13 @@ bool OpenReversal(const SSession &S, const int side, const double extreme)
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
      { Note(what + " skipped: algo trading is disabled", true); return false; }
+
+   // Without the daily ATR every ATR-based buffer and the minimum stop would be zero.
+   if(g_atr <= 0.0)
+      RefreshATR();
+   if(g_atr <= 0.0 && (InpBreakBufferATR > 0.0 || InpReentryBufferATR > 0.0 || InpSLBufferATR > 0.0
+                       || InpMinSLATR > 0.0 || InpMaxSLATR > 0.0))
+     { Note(what + " skipped: daily ATR is not available yet", true); return false; }
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
