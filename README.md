@@ -11,6 +11,9 @@ MQL5/Experts/LineTouchEA.mq5                         the Expert Advisor (single 
 MQL5/Presets/LineTouchEA_XAUUSD_H1_chart_lines.set   preset: trade the lines already on the chart
 MQL5/Presets/LineTouchEA_XAUUSD_H1_builtin.set       preset: self-contained levels (for backtesting)
 MQL5/Experts/SessionSweepEA.mq5                      second EA: session range reversal (see the end of this file)
+MQL5/Presets/SessionSweepEA_XAUUSD_M15.set           its presets for gold,
+MQL5/Presets/SessionSweepEA_EURUSD_M15.set           EURUSD
+MQL5/Presets/SessionSweepEA_GBPUSD_M15.set           and GBPUSD
 tools/gen_presets.py                                 regenerates the presets from the EA's inputs
 tools/mqlcheck/                                      g++-based syntax check used while developing
 ```
@@ -158,8 +161,8 @@ clean state.
   level, take-profit at the next level.
 * `LineTouchEA_XAUUSD_H1_builtin.set` — the same trading rules with self-contained levels.
 
-`python3 tools/gen_presets.py` rebuilds both files from the EA's input list after you
-change the inputs.
+`python3 tools/gen_presets.py` rebuilds the presets of both EAs from their input lists
+after you change the inputs.
 
 ## Notes and limits
 
@@ -328,6 +331,38 @@ with a daily ATR of $40 on XAUUSD they are $0.40 and $2.40. Each distance also h
 `...Points` input (default 0) that acts as a floor if you want a fixed minimum. Slippage
 tolerance defaults to twice the current spread, and the break-even lock is a fraction of
 the trade's risk, so neither needs per-symbol tuning.
+
+## Presets for gold, EURUSD and GBPUSD
+
+Copy the files from `MQL5/Presets/` to `<terminal data folder>\MQL5\Presets\` and pick one
+with the **Load** button of the EA's input dialog. A preset is not tied to the symbol name,
+so it also fits a broker that calls gold `GOLD` or adds a suffix such as `EURUSD.m`.
+
+| File | Chart | What differs from the EA defaults |
+|---|---|---|
+| `SessionSweepEA_XAUUSD_M15.set` | gold | `InpSignalTF` = M15 |
+| `SessionSweepEA_EURUSD_M15.set` | EURUSD | `InpSignalTF` = M15, `InpMinSLATR` = 0.25 |
+| `SessionSweepEA_GBPUSD_M15.set` | GBPUSD | `InpSignalTF` = M15, `InpMinSLATR` = 0.25 |
+
+* **Signal timeframe M15.** It is fixed in the presets so the EA behaves the same on any
+  chart timeframe. Set `InpSignalTF` to M5 if you prefer; the backtests could not tell M5
+  and M15 apart.
+* **Minimum stop 0.25 on forex.** With the default 0.06 a forex stop is only about 8 - 11
+  pips: the spread is then about 10 % of the risk and the spread filter
+  (`InpMaxSpreadPercentOfSL`) skips a third to half of the signals. With 0.25 the stop is
+  about 15 - 19 pips. Trades stay open longer, some overnight.
+* **The other buffers stay at the defaults** (break 0.01, re-entry 0, stop buffer 0.03): no
+  other value tested better on any of the three instruments. A break buffer below 0.01
+  tested worse on all three.
+
+These values come from backtests of a re-implementation of the EA's rules on 5-minute
+data with an assumed spread and no commission, swap or slippage. They found **no proven
+edge**: with these values every result was within noise of zero (gold about +0.06 to
++0.10 R per trade, EURUSD and GBPUSD about +0.04 to +0.09 R), and gold fell to about zero
+with a wider spread and slippage. With the default minimum stop EURUSD lost 0.07 to 0.20 R
+per trade.
+All three charts may share the same `InpMagic`: the EA counts positions and daily limits
+per symbol, so three charts can lose about 3 x `InpMaxDailyLossPercent` in a day.
 
 The EA draws each session box, its high / low lines while they are tradable, and an arrow
 on every signal (grey when the signal was filtered out). The chart comment shows the state

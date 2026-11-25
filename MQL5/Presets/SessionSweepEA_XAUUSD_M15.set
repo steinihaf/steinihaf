@@ -1,0 +1,57 @@
+; SessionSweepEA preset - XAUUSD (gold)
+; Buffers are the EA defaults, as fractions of the daily ATR:
+; break 0.01, re-entry 0, stop buffer 0.03, minimum stop 0.06.
+; Signal timeframe is fixed to M15 (InpSignalTF), so the chart timeframe does not matter.
+; Session times are broker server time for a GMT+2 / GMT+3 server (New York time + 7 hours):
+; compare with the clock in Market Watch and adjust InpAsia / InpLondon / InpNY Start and End.
+; The file is not tied to the symbol name; load it on your broker's chart of this instrument.
+; Backtests of these values showed no proven edge. Run it on a demo account first.
+InpAsiaEnable=true||false||0||true||N
+InpAsiaStart=02:00
+InpAsiaEnd=10:00
+InpLondonEnable=true||false||0||true||N
+InpLondonStart=10:00
+InpLondonEnd=16:30
+InpNYEnable=true||false||0||true||N
+InpNYStart=16:30
+InpNYEnd=23:00
+InpRangeValidHours=10||10||1||20||N
+InpMinSessionBars=4||4||1||14||N
+InpMinRangePoints=0||0||1||10||N
+InpMaxRangePoints=0||0||1||10||N
+InpSignalTF=15||15||0||15||N
+InpBreakMode=0||0||0||1||N
+InpATRPeriod=14||14||1||28||N
+InpBreakBufferATR=0.01||0.01||0.1||1||N
+InpBreakBufferPoints=0||0||1||10||N
+InpReentryBufferATR=0.0||0.0||0.1||1||N
+InpReentryBufferPoints=0||0||1||10||N
+InpMaxBarsOutside=6||6||1||16||N
+InpMaxSweepPercent=50.0||50.0||5||100||N
+InpPermit=0||0||0||2||N
+InpLotMode=1||1||0||1||N
+InpFixedLot=0.1||0.1||0.1||1||N
+InpRiskPercent=0.5||0.5||0.1||1||N
+InpSLBufferATR=0.03||0.03||0.1||1||N
+InpSLBufferPoints=0||0||1||10||N
+InpMinSLATR=0.06||0.06||0.1||1||N
+InpMinSLPoints=0||0||1||10||N
+InpMaxSLATR=0.0||0.0||0.1||1||N
+InpMaxSLPoints=0||0||1||10||N
+InpTPMode=0||0||0||3||N
+InpTPRR=2.0||2.0||0.2||4||N
+InpMinRR=1.0||1.0||0.1||2||N
+InpBreakEvenRR=1.0||1.0||0.1||2||N
+InpBreakEvenLockR=0.05||0.05||0.1||1||N
+InpMaxSpreadPoints=0||0||1||10||N
+InpMaxSpreadPercentOfSL=15.0||15.0||1.5||30||N
+InpMaxOpenPositions=1||1||1||11||N
+InpMaxTradesPerDay=3||3||1||13||N
+InpMaxDailyLossPercent=2.0||2.0||0.2||4||N
+InpCloseTime=
+InpMagic=20261124||20261124||1||40522248||N
+InpDeviationPoints=0||0||1||10||N
+InpDraw=true||false||0||true||N
+InpAlerts=false||false||0||true||N
+InpDashboard=true||false||0||true||N
+InpVerbose=false||false||0||true||N
