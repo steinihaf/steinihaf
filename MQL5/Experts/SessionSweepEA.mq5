@@ -19,7 +19,7 @@
 //+------------------------------------------------------------------+
 #property copyright   "steinihaf"
 #property link        "https://github.com/steinihaf/steinihaf"
-#property version     "1.11"
+#property version     "1.20"
 #property description "Session range reversal: when a session high/low is broken and price"
 #property description "closes back inside the range, trade in the reversal direction."
 
@@ -42,6 +42,12 @@ enum ENUM_SS_BREAK
   {
    SS_BREAK_WICK  = 0,                // Wick: any trade beyond the level counts as a break
    SS_BREAK_CLOSE = 1                 // Close: a bar must close beyond the level first
+  };
+
+enum ENUM_SS_ENTRY
+  {
+   SS_ENTRY_CLOSE   = 0,              // Bar close: wait for a bar to close back inside the range
+   SS_ENTRY_INSTANT = 1               // Instant: enter as soon as price is back inside (while the wick forms)
   };
 
 enum ENUM_SS_PERMIT
@@ -93,6 +99,9 @@ input double InpReentryBufferATR  = 0.0;            // Re-entry buffer: bar must
 input int    InpReentryBufferPoints = 0;            // ...and by at least N points
 input int    InpMaxBarsOutside    = 6;              // Reversal must come within N bars of the break (else: real breakout, no trade)
 input double InpMaxSweepPercent   = 50.0;           // Break may run at most N% of the range beyond the level (0 = off)
+input ENUM_SS_ENTRY InpEntryTiming = SS_ENTRY_CLOSE; // When to enter the reversal
+input double InpMinWickPercent    = 0.0;            // Filter: rejection wick of the signal bar at least N% of its range (0 = off)
+input double InpVolumeFactor      = 0.0;            // Filter: signal bar tick volume at least N x the average of the 20 bars before (0 = off)
 input ENUM_SS_PERMIT InpPermit    = SS_PERMIT_BOTH; // Allowed directions
 
 input group "=== Risk ==="
@@ -110,6 +119,8 @@ input double InpTPRR              = 2.0;            // Take-profit R multiple (R
 input double InpMinRR             = 1.0;            // Middle / Opposite: skip when reward / risk is below N (0 = off)
 input double InpBreakEvenRR       = 1.0;            // Move stop to break-even after N x R profit (0 = off)
 input double InpBreakEvenLockR    = 0.05;           // Break-even lock: stop goes N x R beyond the entry
+input double InpTrailATR          = 0.0;            // Trailing stop: follow price at N x daily ATR once that locks in profit (0 = off)
+input double InpTrailStepATR      = 0.01;           // Trailing stop: move it in steps of at least N x daily ATR
 
 input group "=== Limits ==="
 input int    InpMaxSpreadPoints   = 0;              // Max spread (points, 0 = off)
@@ -449,7 +460,8 @@ void ManagePositions()
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    bool closeAll = (g_closeMin >= 0 && dt.hour * 60 + dt.min >= g_closeMin);
-   if(!closeAll && InpBreakEvenRR <= 0.0)
+   bool trail    = (InpTrailATR > 0.0 && g_atr > 0.0);
+   if(!closeAll && InpBreakEvenRR <= 0.0 && !trail)
       return;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -463,23 +475,45 @@ void ManagePositions()
          g_trade.PositionClose(ticket);
          continue;
         }
-      bool   buy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl   = PositionGetDouble(POSITION_SL);
-      double tp   = PositionGetDouble(POSITION_TP);
-      if(sl == 0.0 || (buy && sl >= open) || (!buy && sl <= open))
-         continue;                                   // no stop, or already at break-even
-      double risk  = MathAbs(open - sl);
+      bool   buy   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
       double price = buy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double gain  = buy ? price - open : open - price;
-      if(gain < risk * InpBreakEvenRR)
+      double newSL = sl;
+      string why   = "";
+
+      // Break-even: only while the stop is still on the losing side of the entry.
+      if(InpBreakEvenRR > 0.0 && sl != 0.0 && ((buy && sl < open) || (!buy && sl > open)))
+        {
+         double risk = MathAbs(open - sl);
+         double gain = buy ? price - open : open - price;
+         if(gain >= risk * InpBreakEvenRR)
+           {
+            newSL = RoundToTick(buy ? open + risk * InpBreakEvenLockR : open - risk * InpBreakEvenLockR);
+            why = "break-even";
+           }
+        }
+      // Trailing: follow price at a fixed distance, but only once that stop is beyond the entry.
+      if(trail)
+        {
+         double cand = RoundToTick(buy ? price - g_atr * InpTrailATR : price + g_atr * InpTrailATR);
+         double step = g_atr * MathMax(InpTrailStepATR, 0.0);
+         bool locks  = buy ? cand > open : cand < open;
+         bool better = (newSL == 0.0) || (buy ? cand >= newSL + step : cand <= newSL - step);
+         if(locks && better)
+           {
+            newSL = cand;
+            why = "trailing";
+           }
+        }
+      if(newSL == sl || why == "")
          continue;
-      double newSL = RoundToTick(buy ? open + risk * InpBreakEvenLockR : open - risk * InpBreakEvenLockR);
       double stops = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
       if((buy && newSL > price - stops) || (!buy && newSL < price + stops))
          continue;
       if(g_trade.PositionModify(ticket, newSL, tp))
-         Note("stop moved to break-even on #" + IntegerToString((long)ticket), true);
+         Note("stop moved (" + why + ") to " + PriceStr(newSL) + " on #" + IntegerToString((long)ticket), why == "break-even");
      }
   }
 
@@ -497,7 +531,7 @@ bool FindLastSession(const SSession &S, const datetime now, datetime &rs, dateti
       if(re > now)
          continue;
       MqlRates r[];
-      int n = CopyRates(_Symbol, g_tf, rs, re - 1, r);
+      int n = CopyRates(_Symbol, g_tf, rs, (datetime)(re - 1), r);
       if(n < MathMax(InpMinSessionBars, 1))
          continue;                                   // weekend / holiday / too little history
       hi = r[0].high;
@@ -510,6 +544,93 @@ bool FindLastSession(const SSession &S, const datetime now, datetime &rs, dateti
       return true;
      }
    return false;
+  }
+
+// Optional filters on the bar that gives the signal. "close" is the bar's close, or the
+// current price while the bar is still forming (instant entry).
+bool SignalBarOK(const MqlRates &bar, const bool high, const double close, string &why)
+  {
+   if(InpMinWickPercent > 0.0)
+     {
+      double range = bar.high - bar.low;
+      double wick  = high ? bar.high - MathMax(bar.open, close) : MathMin(bar.open, close) - bar.low;
+      if(range <= 0.0 || wick < range * InpMinWickPercent / 100.0)
+        {
+         why = "wick too small";
+         return false;
+        }
+     }
+   if(InpVolumeFactor > 0.0)
+     {
+      MqlRates prev[];
+      int n = CopyRates(_Symbol, g_tf, (datetime)(bar.time - 1), 20, prev);   // the 20 bars before the signal bar
+      double sum = 0.0;
+      for(int i = 0; i < n; i++)
+         sum += (double)prev[i].tick_volume;
+      if(n < 5 || (double)bar.tick_volume < InpVolumeFactor * sum / n)
+        {
+         why = "volume too low";
+         return false;
+        }
+     }
+   return true;
+  }
+
+// A failed break was seen on this side: trade it and mark the signal on the chart.
+void FireReversal(SSession &S, const int side, const datetime barTime, const double arrowPrice)
+  {
+   bool high = (side == SS_HIGH);
+   string tag = S.name + (high ? " high " : " low ") + PriceStr(high ? S.hi : S.lo);
+   bool traded = OpenReversal(S, side, S.ext[side]);
+   DrawSignal(S, side, barTime, arrowPrice, traded);
+   if(InpAlerts)
+      Alert(SS_NAME, " ", _Symbol, ": ", tag, " break failed -> ", high ? "SELL" : "BUY",
+            traded ? "" : " (not traded)");
+  }
+
+// Instant entry: looks at the bar that is still forming and trades as soon as price has
+// gone beyond a level and come back inside it. Called on every tick.
+void CheckInstant(SSession &S)
+  {
+   if(!S.enabled || !S.valid || S.rs == 0)
+      return;
+   if(S.state[SS_HIGH] == SS_SPENT && S.state[SS_LOW] == SS_SPENT)
+      return;
+   MqlRates r[];
+   if(CopyRates(_Symbol, g_tf, 0, 1, r) != 1)
+      return;
+   if(r[0].time < S.re || r[0].time >= S.expiry || r[0].time <= S.lastBar)
+      return;
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double range = S.hi - S.lo;
+   for(int side = 0; side < 2; side++)
+     {
+      if(S.state[side] == SS_SPENT)
+         continue;
+      bool   high  = (side == SS_HIGH);
+      double level = high ? S.hi : S.lo;
+      double ext   = high ? r[0].high : r[0].low;
+      if(S.state[side] == SS_BROKEN)
+         ext = high ? MathMax(ext, S.ext[side]) : MathMin(ext, S.ext[side]);
+      else
+        {
+         // Still armed: the forming bar itself must have broken the level (wick mode only).
+         double brkBuf = Dist(InpBreakBufferPoints, InpBreakBufferATR);
+         if(InpBreakMode != SS_BREAK_WICK || !(high ? ext > level + brkBuf : ext < level - brkBuf))
+            continue;
+        }
+      if(InpMaxSweepPercent > 0.0 && MathAbs(ext - level) > range * InpMaxSweepPercent / 100.0)
+         continue;                                   // ran too far; the bar close will retire the level
+      double reBuf = Dist(InpReentryBufferPoints, InpReentryBufferATR);
+      if(!(high ? bid < level - reBuf : bid > level + reBuf))
+         continue;                                   // not back inside yet
+      string why = "";
+      if(!SignalBarOK(r[0], high, bid, why))
+         continue;                                   // may still pass later in this bar
+      S.state[side] = SS_SPENT;
+      S.ext[side]   = ext;
+      FireReversal(S, side, r[0].time, ext);
+     }
   }
 
 // Feeds one closed bar to both sides of a session range. "live" bars may trade,
@@ -559,14 +680,15 @@ void ProcessBar(SSession &S, const MqlRates &bar, const bool live)
       if(back)
         {
          S.state[side] = SS_SPENT;                   // one reversal per side per session range
-         if(live)
+         string why = "";
+         if(!SignalBarOK(bar, high, bar.close, why))
            {
-            bool traded = OpenReversal(S, side, S.ext[side]);
-            DrawSignal(S, side, bar.time, high ? bar.high : bar.low, traded);
-            if(InpAlerts)
-               Alert(SS_NAME, " ", _Symbol, ": ", tag, " break failed -> ", high ? "SELL" : "BUY",
-                     traded ? "" : " (not traded)");
+            if(live)
+               Note(tag + " reversal skipped: " + why);
+            continue;
            }
+         if(live)
+            FireReversal(S, side, bar.time, high ? bar.high : bar.low);
          continue;
         }
       if(S.bars[side] >= InpMaxBarsOutside)
@@ -610,7 +732,7 @@ void UpdateSession(SSession &S, const datetime now, const datetime lastClosed)
    if(!S.valid || S.lastBar >= lastClosed)
       return;
    MqlRates r[];
-   int n = CopyRates(_Symbol, g_tf, S.lastBar + 1, lastClosed, r);
+   int n = CopyRates(_Symbol, g_tf, (datetime)(S.lastBar + 1), lastClosed, r);
    for(int i = 0; i < n; i++)
      {
       if(r[i].time <= S.lastBar || r[i].time > lastClosed)
@@ -722,8 +844,16 @@ void OnTick()
    ManagePositions();
 
    datetime now = iTime(_Symbol, g_tf, 0);
-   if(now == 0 || now == g_lastBar)
+   if(now == 0)
       return;
+   if(now == g_lastBar)
+     {
+      // Same bar as before: only the instant entry looks inside a forming bar.
+      if(InpEntryTiming == SS_ENTRY_INSTANT)
+         for(int i = 0; i < SS_SESSIONS; i++)
+            CheckInstant(g_s[i]);
+      return;
+     }
    datetime lastClosed = iTime(_Symbol, g_tf, 1);
    if(lastClosed == 0)
       return;

@@ -319,9 +319,12 @@ side of each session range is traded at most once.
 | `InpMaxSpreadPercentOfSL` | 15 | Skip the trade when the spread is more than this % of the stop distance |
 | `InpMaxBarsOutside` | 6 | Reversal must come within this many bars of the break |
 | `InpMaxSweepPercent` | 50 | The break may run at most this % of the range beyond the level |
+| `InpEntryTiming` | Bar close | *Bar close*: wait for a bar to close back inside the range. *Instant*: enter on the tick price is back inside, while the wick is still forming (stop beyond the high / low reached so far) |
+| `InpMinWickPercent`, `InpVolumeFactor` | off | Optional filters on the signal bar: its rejection wick must be at least this % of its range; its tick volume at least this many times the average of the 20 bars before |
 | `InpLotMode`, `InpRiskPercent`, `InpFixedLot` | Risk, 0.5 % | Position size; in risk mode the trade is skipped if even the minimum lot would risk more |
 | `InpTPMode` | R multiple (2.0) | Or: middle of the range, opposite side of the range, none |
 | `InpBreakEvenRR` | 1.0 | Move the stop to break-even after this many R of profit |
+| `InpTrailATR`, `InpTrailStepATR` | off, 0.01 | Trailing stop: follow price at this fraction of the daily ATR once that puts the stop beyond the entry. With the 2 R target it rarely matters; set `InpTPMode` to *No take-profit* to let it run |
 | `InpMaxTradesPerDay`, `InpMaxDailyLossPercent`, `InpMaxOpenPositions` | 3, 2 %, 1 | Daily and exposure limits |
 | `InpCloseTime` | off | Close everything and stop trading at this server time |
 
@@ -384,6 +387,15 @@ The EA draws each session box, its high / low lines while they are tradable, and
 on every signal (grey when the signal was filtered out). The chart comment shows the state
 of every level and the reason the last signal was skipped. After a restart the EA replays
 the bars since the session ended, so it does not re-trade a level that already fired.
+
+**Instant entry, trailing and the filters are options, not improvements shown by a test.**
+Instant entry gets a better price when the wick holds and a losing trade when price pushes
+through again within the same bar; 5-minute test data cannot see inside a bar, and the
+nearest stand-in (M5 signals instead of M15) did not test better. A trailing stop of 0.10
+to 0.25 x daily ATR gave more small winners and the same or a slightly lower average than
+the fixed 2 R target (gold, EURUSD and GBPUSD, same entries re-walked). A large rejection
+wick on the signal bar did not go with better results in any consistent way. The volume
+filter could not be tested: the price history used has no volume.
 
 This EA has passed the `tools/mqlcheck` syntax check only. Compile it in MetaEditor and
 run it in the Strategy Tester and on a demo account before trading it live.

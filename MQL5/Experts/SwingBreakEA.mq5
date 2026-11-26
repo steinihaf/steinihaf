@@ -639,7 +639,7 @@ void OnTick()
       return;
      }
    g_lastBar = now;
-   int n = CopyRates(_Symbol, g_tf, g_lastDone + 1, lastClosed, r);
+   int n = CopyRates(_Symbol, g_tf, (datetime)(g_lastDone + 1), lastClosed, r);
    for(int i = 0; i < n; i++)
      {
       if(r[i].time <= g_lastDone || r[i].time > lastClosed)
