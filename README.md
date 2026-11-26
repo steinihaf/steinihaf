@@ -14,6 +14,7 @@ MQL5/Experts/SessionSweepEA.mq5                      second EA: session range re
 MQL5/Presets/SessionSweepEA_XAUUSD_M15.set           its presets for gold,
 MQL5/Presets/SessionSweepEA_EURUSD_M15.set           EURUSD
 MQL5/Presets/SessionSweepEA_GBPUSD_M15.set           and GBPUSD
+MQL5/Experts/SwingBreakEA.mq5                        prototype: break / sweep of the last swing high or low (see the end)
 tools/gen_presets.py                                 regenerates the presets from the EA's inputs
 tools/mqlcheck/                                      g++-based syntax check used while developing
 ```
@@ -386,3 +387,44 @@ the bars since the session ended, so it does not re-trade a level that already f
 
 This EA has passed the `tools/mqlcheck` syntax check only. Compile it in MetaEditor and
 run it in the Strategy Tester and on a demo account before trading it live.
+
+# SwingBreakEA — prototype: the last swing high / low
+
+`MQL5/Experts/SwingBreakEA.mq5` is a **prototype** for trying one idea on a demo account. It
+tracks the last swing high and the last swing low of the signal timeframe (a high counts
+once price has fallen `InpSwingATR` x daily ATR away from it, and the reverse for a low)
+and trades them in one of two ways (`InpMode`):
+
+| Mode | Signal | Trade | Stop |
+|---|---|---|---|
+| **Break** (default) | a bar closes beyond the level by `InpBreakConfirm` x swing size | **with** the break | just behind the broken level |
+| **Sweep** | price pokes beyond the level and a bar closes back inside | the **reversal** | beyond the poke |
+
+Defaults: signal timeframe H1 (set in `InpSignalTF`, the chart timeframe does not matter),
+swing size 0.5 x daily ATR, confirmation 0.5 x swing size, target 2 R, break-even at 1 R,
+0.5 % risk per trade. For other timeframes use a swing size of about 0.25 (M15) or 1.0 (H4).
+
+**What the tests said** (a re-implementation of these rules on gold price history with a
+0.25 USD spread, no commission, swap or slippage; not a Strategy Tester run):
+
+* *Break mode, gold, H1, 2020 - 2026:* 637 trades (about 94 a year), **+0.14 R per trade**
+  (standard error 0.05). Positive in 5 of 7 years, about zero in 2021 and 2023. Almost all
+  of it came from buys (+0.22 R; sells +0.05 R) while gold was rising, so it may be the
+  trend more than the rule. Nearby settings were all positive (+0.05 to +0.22 R); with
+  twice the spread +0.12 R. About 29 % of trades reached the target, 45 % were stopped
+  out, the rest ended near break-even; the deepest losing run was about 17 R.
+* *Sweep mode:* slightly negative on gold (-0.06 R per trade on H1 over the same years)
+  and on EURUSD and GBPUSD; no setting tested reliably positive.
+* *Break mode elsewhere:* about zero on gold M15 and negative on EURUSD and GBPUSD (one
+  year of data). Treat the defaults as a gold H1 setup.
+
+**Account size.** The stop is wide: typically 0.3 - 0.6 of the daily range, about 30 - 60
+USD per ounce on gold at the moment. With 0.5 % risk and a 0.01 minimum lot the EA
+therefore skips most gold trades below a balance of roughly 7,000 USD (log: *lot size
+below the symbol minimum for this risk*). Raising `InpRiskPercent` or using a fixed lot
+makes it trade, at the price of risking more per trade.
+
+Like the other EAs here it has passed the `tools/mqlcheck` syntax check only: compile it
+in MetaEditor and run it in the Strategy Tester (*Every tick* or *1 minute OHLC*) and on a
+demo account first. After attaching it reads `InpHistoryBars` bars to find the current
+swings and never trades on those; it trades from the next closed bar on.
